@@ -1,0 +1,15 @@
+results/
+models/*
+!models/.gitkeep
+.venv/
+__pycache__/
+native/server/target/
+native/engine/build/
+native/background/
+/sdk
+/hikari-renderer
+/hikari-renderer.exe
+native/launcher/target/
+/CubismSdkForNative-*.zip
+/libLive2DCubismCore.*
+/Live2DCubismCore.dll

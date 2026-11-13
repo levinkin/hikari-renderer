@@ -1,0 +1,9 @@
+{
+    "model": "",
+    "face": "neutral",
+    "port": 8793,
+    "size": [960, 720],
+    "idle_actions": ["look_around", "glance_left", "glance_right", "double_blink", "yawn", "tilt_smile", "look_up_think"],
+    "action_every": 15,
+    "idle_loop": ""
+}

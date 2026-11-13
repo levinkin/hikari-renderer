@@ -1,0 +1,127 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Expressions": [
+			{
+				"Name": "angry",
+				"File": "states/angry.exp3.json"
+			},
+			{
+				"Name": "confused",
+				"File": "states/confused.exp3.json"
+			},
+			{
+				"Name": "crying",
+				"File": "states/crying.exp3.json"
+			},
+			{
+				"Name": "doubtful",
+				"File": "states/doubtful.exp3.json"
+			},
+			{
+				"Name": "excited",
+				"File": "states/excited.exp3.json"
+			},
+			{
+				"Name": "grumpy",
+				"File": "states/grumpy.exp3.json"
+			},
+			{
+				"Name": "happy",
+				"File": "states/happy.exp3.json"
+			},
+			{
+				"Name": "laughing",
+				"File": "states/laughing.exp3.json"
+			},
+			{
+				"Name": "listening",
+				"File": "states/listening.exp3.json"
+			},
+			{
+				"Name": "neutral",
+				"File": "states/neutral.exp3.json"
+			},
+			{
+				"Name": "sad",
+				"File": "states/sad.exp3.json"
+			},
+			{
+				"Name": "thinking",
+				"File": "states/thinking.exp3.json"
+			}
+		],
+		"Motions": {
+			"look_left": [
+				{
+					"File": "actions/look_left.motion3.json"
+				}
+			],
+			"look_right": [
+				{
+					"File": "actions/look_right.motion3.json"
+				}
+			],
+			"look_up": [
+				{
+					"File": "actions/look_up.motion3.json"
+				}
+			],
+			"look_down": [
+				{
+					"File": "actions/look_down.motion3.json"
+				}
+			],
+			"look_ahead": [
+				{
+					"File": "actions/look_ahead.motion3.json"
+				}
+			],
+			"dance": [
+				{
+					"File": "actions/dance.motion3.json"
+				}
+			],
+			"sleep": [
+				{
+					"File": "actions/sleep.motion3.json"
+				}
+			],
+			"look_around": [
+				{
+					"File": "actions/look_around.motion3.json"
+				}
+			],
+			"glance_left": [
+				{
+					"File": "actions/glance_left.motion3.json"
+				}
+			],
+			"glance_right": [
+				{
+					"File": "actions/glance_right.motion3.json"
+				}
+			],
+			"double_blink": [
+				{
+					"File": "actions/double_blink.motion3.json"
+				}
+			],
+			"yawn": [
+				{
+					"File": "actions/yawn.motion3.json"
+				}
+			],
+			"tilt_smile": [
+				{
+					"File": "actions/tilt_smile.motion3.json"
+				}
+			],
+			"look_up_think": [
+				{
+					"File": "actions/look_up_think.motion3.json"
+				}
+			]
+		}
+	}
+}
