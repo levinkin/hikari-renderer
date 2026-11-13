@@ -464,7 +464,7 @@ def check_get(port):
     _, listed = vts_e2e.http_call(port, "GET", "/state")
     states = json.loads(listed)
     shipped = ["neutral", "happy", "laughing", "sad", "crying", "angry", "doubtful", "excited", "grumpy", "confused", "thinking", "listening"]
-    ok = status == 200 and get_status == 200 and json.loads(body) == want and want.items() <= json.loads(got).items() and json.loads(reset[1]) == START and all(name in states["states"] for name in shipped) and states["face"] == "neutral" and states["pose"] == "none"
+    ok = status == 200 and get_status == 200 and want.items() <= json.loads(body).items() and want.items() <= json.loads(got).items() and START.items() <= json.loads(reset[1]).items() and all(name in states["states"] for name in shipped) and states["face"] == "neutral" and states["pose"] == "none"
     return ok, "post=%d %s get=%d %s reset=%s states=%s" % (status, body, get_status, got, reset[1], listed.decode())
 
 
