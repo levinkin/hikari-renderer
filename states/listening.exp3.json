@@ -37,6 +37,21 @@
       "Id": "ParamMouthForm",
       "Value": 0.3,
       "Blend": "Add"
+    },
+    {
+      "Id": "ParamAngleZ",
+      "Value": 20,
+      "Blend": "Overwrite"
+    },
+    {
+      "Id": "ParamAngleY",
+      "Value": -10,
+      "Blend": "Overwrite"
+    },
+    {
+      "Id": "Param36",
+      "Value": 1,
+      "Blend": "Overwrite"
     }
   ]
 }

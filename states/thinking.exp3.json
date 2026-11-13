@@ -45,8 +45,23 @@
     },
     {
       "Id": "ParamAngleZ",
-      "Value": -10,
-      "Blend": "Add"
+      "Value": -20,
+      "Blend": "Overwrite"
+    },
+    {
+      "Id": "ParamAngleX",
+      "Value": -24,
+      "Blend": "Overwrite"
+    },
+    {
+      "Id": "ParamAngleY",
+      "Value": 22,
+      "Blend": "Overwrite"
+    },
+    {
+      "Id": "Param37",
+      "Value": 1,
+      "Blend": "Overwrite"
     }
   ]
 }
