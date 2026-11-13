@@ -23,7 +23,7 @@ static VTS_INPUTS: [(&CStr, &str); 12] = [
 
 const YAW_PER_ANGLE_X: f64 = 0.6;
 const PITCH_PER_ANGLE_Y: f64 = 0.5;
-const PITCH_HOME: f64 = 225.0;
+const PITCH_HOME: f64 = 150.0;
 const HEAD_SMOOTH_MS: f64 = 80.0;
 const HEAD_TURN_SCALE: f32 = 0.6;
 
@@ -130,7 +130,7 @@ impl Behavior {
             random_wait_ms: -1.0,
             pool: Vec::new(),
             action_every_ms: (15000.0, 15000.0),
-            head: [0, 0, 0, 225],
+            head: [0, 0, 0, 150],
             head_at: [0.0, PITCH_HOME],
             head_dt_ms: 0.0,
             head_lead_ms: 0.0,

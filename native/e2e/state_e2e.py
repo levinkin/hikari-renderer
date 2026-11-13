@@ -61,7 +61,7 @@ GAP_LIMIT = 2.0 / FPS
 LOOK_YAW = 150
 LOOK_PITCH = 150
 AHEAD_BAND = 30
-PITCH_HOME = 225
+PITCH_HOME = 150
 LOOKS = {"look_left": (0, -1), "look_right": (0, 1), "look_up": (1, 1), "look_down": (1, -1)}
 GIF = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
 
