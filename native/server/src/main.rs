@@ -820,7 +820,7 @@ fn handle_idle(app: &App, out: &mut TcpStream, fps: f64, size: (usize, usize), c
             break;
         }
         behind_max = behind_max.max(t0.elapsed().as_secs_f64() * 1000.0 - pts);
-        k += 1;
+        k = (k + 1).max((t0.elapsed().as_secs_f64() * fps) as u64);
     }
     let mut shown = picture.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(index) = shown.wants.iter().position(|want| want.0 == size && want.1 == codec_id && want.2 == fps) {
