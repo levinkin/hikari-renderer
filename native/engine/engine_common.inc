@@ -6,6 +6,13 @@
 
 static const float kBackgroundStepMs = 2000.0f / 24.0f;
 
+extern thread_local bool physics_drop_turns;
+
+static void framework_log(const char* message)
+{
+    fputs(message, stderr);
+}
+
 class engine_allocator : public ICubismAllocator
 {
     void* Allocate(const csmSizeType size)
@@ -87,6 +94,9 @@ struct engine : public CubismUserModel, public engine_gpu
     float view_rot = 0;
     float physics_weight = 1;
     float wind = 0;
+    float wind_direction = 0;
+    float gravity_degrees = NAN;
+    bool drop_turns = false;
     double wind_clock = 0;
     float wind_phase[4] = {0, 0, 0, 0};
     std::vector<physics_scale> physics_scales;
@@ -100,9 +110,11 @@ struct engine : public CubismUserModel, public engine_gpu
     uint32_t motion_seed = 0;
     unsigned int blink_seed = 1;
     csmVector<CubismIdHandle> blink_ids;
+    std::vector<csmInt32> blink_indices;
     csmVector<CubismIdHandle> lip_ids;
     std::vector<float> blink_open;
     std::map<ACubismMotion*, std::vector<csmInt32>> motion_params;
+    std::map<ACubismMotion*, bool> holds_eyes;
     std::vector<char> rest_marks;
 
     ~engine()
@@ -139,8 +151,26 @@ static std::string gpu_name;
 
 static std::vector<uint8_t> read_file(const std::string& path)
 {
-    std::ifstream file(path, std::ios::binary);
-    return std::vector<uint8_t>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    std::filesystem::path file_path = std::filesystem::u8path(path);
+    std::error_code error;
+    uintmax_t size = std::filesystem::file_size(file_path, error);
+    if (error || size > 2147483647u)
+    {
+        return std::vector<uint8_t>();
+    }
+    std::ifstream file(file_path, std::ios::binary);
+    try
+    {
+        std::vector<uint8_t> bytes((size_t)size);
+        if (file.read((char*)bytes.data(), (std::streamsize)size) && (uintmax_t)file.gcount() == size)
+        {
+            return bytes;
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+    }
+    return std::vector<uint8_t>();
 }
 
 static bool motion_segments_ok(const std::vector<uint8_t>& bytes)
@@ -182,9 +212,9 @@ static void motion_part_opacities(engine* e, const std::string& dir)
     if (files.empty())
     {
         std::error_code error;
-        for (std::filesystem::recursive_directory_iterator it(dir, error), end; !error && it != end; it.increment(error))
+        for (std::filesystem::recursive_directory_iterator it(std::filesystem::u8path(dir), error), end; !error && it != end; it.increment(error))
         {
-            std::string file = it->path().string();
+            std::string file = it->path().u8string();
             if (file.size() > 13 && file.compare(file.size() - 13, 13, ".motion3.json") == 0)
             {
                 files.push_back(file);
@@ -258,6 +288,12 @@ static ACubismMotion* motion_load(engine* e, const std::string& path, const csmC
             params.push_back(index);
         }
     }
+    bool holds = false;
+    for (csmInt32 blink_index : e->blink_indices)
+    {
+        holds = holds || std::find(params.begin(), params.end(), blink_index) != params.end();
+    }
+    e->holds_eyes[motion] = holds;
     return motion;
 }
 
@@ -287,12 +323,14 @@ static void view_matrix(engine* e)
 static engine* load_model(const std::string& path, const std::string& dir, int width, int height)
 {
     std::vector<uint8_t> json = read_file(path);
-    if (json.empty())
+    CubismModelSettingJson* setting = json.empty() ? NULL : new CubismModelSettingJson(json.data(), (csmSizeInt)json.size());
+    if (setting == NULL || !setting->IsValid())
     {
+        delete setting;
         return NULL;
     }
     engine* e = new engine();
-    e->setting = new CubismModelSettingJson(json.data(), (csmSizeInt)json.size());
+    e->setting = setting;
     std::string moc_path = dir + e->setting->GetModelFileName();
     {
         std::lock_guard<std::mutex> guard(moc_lock);
@@ -300,7 +338,7 @@ static engine* load_model(const std::string& path, const std::string& dir, int w
         if (shared.moc == NULL)
         {
             std::vector<uint8_t> moc = read_file(moc_path);
-            shared.moc = CubismMoc::Create(moc.data(), (csmSizeInt)moc.size());
+            shared.moc = moc.empty() ? NULL : CubismMoc::Create(moc.data(), (csmSizeInt)moc.size(), true);
         }
         if (shared.moc == NULL)
         {
@@ -331,7 +369,7 @@ static engine* load_model(const std::string& path, const std::string& dir, int w
         std::string name = file.substr(file.find_last_of("/\\") + 1);
         name = name.substr(0, name.find(".exp3.json"));
         std::vector<uint8_t> bytes = read_file(dir + file);
-        ACubismMotion* motion = e->LoadExpression(bytes.data(), (csmSizeInt)bytes.size(), name.c_str());
+        ACubismMotion* motion = bytes.empty() ? NULL : e->LoadExpression(bytes.data(), (csmSizeInt)bytes.size(), name.c_str());
         if (motion != NULL)
         {
             e->expressions[name] = motion;
@@ -361,6 +399,7 @@ static engine* load_model(const std::string& path, const std::string& dir, int w
     for (csmInt32 i = 0; i < e->setting->GetEyeBlinkParameterCount(); i++)
     {
         e->blink_ids.PushBack(e->setting->GetEyeBlinkParameterId(i));
+        e->blink_indices.push_back(e->_model->GetParameterIndex(e->setting->GetEyeBlinkParameterId(i)));
     }
     for (csmInt32 i = 0; i < e->setting->GetLipSyncParameterCount(); i++)
     {
@@ -444,9 +483,30 @@ float engine_param_get(engine* e, const char* id)
     return e->_model->GetParameterValue(CubismFramework::GetIdManager()->GetId(id));
 }
 
+const char* engine_param_at(engine* e, int index, float* minimum, float* maximum)
+{
+    if (index < 0 || index >= e->_model->GetParameterCount())
+    {
+        return NULL;
+    }
+    *minimum = e->_model->GetParameterMinimumValue(index);
+    *maximum = e->_model->GetParameterMaximumValue(index);
+    return e->_model->GetParameterId(index)->GetString().GetRawString();
+}
+
 void engine_param_set(engine* e, const char* id, float value)
 {
     e->_model->SetParameterValue(CubismFramework::GetIdManager()->GetId(id), value);
+}
+
+int engine_param_index(engine* e, const char* id)
+{
+    return e->_model->GetParameterIndex(CubismFramework::GetIdManager()->GetId(id));
+}
+
+void engine_param_set_at(engine* e, int index, float value)
+{
+    e->_model->SetParameterValue(index, value);
 }
 
 bool engine_expression(engine* e, int layer, const char* name)
@@ -500,13 +560,22 @@ void engine_expression_fade(engine* e, const char* name, float seconds)
     found->second->SetFadeOutTime(seconds);
 }
 
-void engine_physics_set(engine* e, float strength, float wind)
+void engine_physics_set(engine* e, float strength, float wind, float wind_degrees, float gravity_degrees)
 {
-    e->physics_weight = std::fmin(std::fmax(strength / 50.0f, 0.0f), 2.0f);
+    e->physics_weight = std::fmax(strength / 50.0f, 0.0f);
     e->wind = std::isfinite(wind) ? wind / 100.0f : 0.0f;
+    e->wind_direction = fmodf(wind_degrees - 90.0f, 360.0f) * (float)M_PI / 180.0f;
+    if (std::fabs(gravity_degrees - e->gravity_degrees) >= 180.0f)
+    {
+        e->drop_turns = true;
+    }
+    e->gravity_degrees = gravity_degrees;
     if (e->_physics != NULL)
     {
         CubismPhysics::Options options = e->_physics->GetOptions();
+        float radians = fmodf(gravity_degrees, 360.0f) * (float)M_PI / 180.0f;
+        options.Gravity.X = sinf(radians);
+        options.Gravity.Y = -cosf(radians);
         options.Wind.X = 0.0f;
         options.Wind.Y = 0.0f;
         e->_physics->SetOptions(options);
@@ -654,11 +723,7 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
         ACubismMotion* motion = entry->GetCubismMotion();
         char mark = entry->IsTriggeredFadeOut() || (entry->GetEndTime() >= 0.0f && entry->GetStateTime() >= entry->GetEndTime() - motion->GetFadeOutTime()) ? 1 : 2;
         bool idle_motion = e->idle != NULL && std::find(e->idle->begin(), e->idle->end(), motion) != e->idle->end();
-        for (csmUint32 b = 0; mark == 2 && !idle_motion && b < e->blink_ids.GetSize(); b++)
-        {
-            csmInt32 blink_index = e->_model->GetParameterIndex(e->blink_ids[b]);
-            eyes_held = eyes_held || std::find(e->motion_params[motion].begin(), e->motion_params[motion].end(), blink_index) != e->motion_params[motion].end();
-        }
+        eyes_held = eyes_held || (mark == 2 && !idle_motion && e->holds_eyes[motion]);
         for (csmInt32 index : e->motion_params[motion])
         {
             e->rest_marks[index] = std::max(e->rest_marks[index], mark);
@@ -723,14 +788,18 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
             double t = e->wind_clock;
             const float* p = e->wind_phase;
             CubismPhysics::Options options = e->_physics->GetOptions();
-            options.Wind.X = e->wind * (float)((0.6 * sin(0.31 * t + p[0]) + 0.4 * sin(0.97 * t + p[1])) * (0.75 + 0.25 * sin(2.3 * t + p[2])));
-            options.Wind.Y = e->wind * (float)(0.25 * sin(0.53 * t + p[3]));
+            double gusts = 0.45 * sin(3.1 * t + p[0]) + 0.35 * sin(5.3 * t + p[1]) + 0.2 * sin(1.3 * t + p[2]);
+            float along = e->wind * (float)((0.45 + 0.45 * gusts) * (0.7 + 0.3 * sin(0.23 * t + p[3])));
+            float across = e->wind * (float)(0.08 * sin(2.9 * t + p[1]));
+            options.Wind.X = along * cosf(e->wind_direction) + across * sinf(e->wind_direction);
+            options.Wind.Y = across * cosf(e->wind_direction) - along * sinf(e->wind_direction);
             e->_physics->SetOptions(options);
             if (!e->physics_scales.empty())
             {
-                gust = std::fmin(std::hypot(options.Wind.X, options.Wind.Y), 1.0f);
+                gust = std::fmin(std::hypot(along, across) / (0.9f * std::fabs(e->wind)), 1.0f);
             }
         }
+        physics_drop_turns = e->drop_turns;
         if (e->physics_weight == 1.0f && e->physics_scales.empty())
         {
             e->_physics->Evaluate(e->_model, dt);
@@ -760,14 +829,12 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
                 }
             }
         }
+        e->drop_turns = physics_drop_turns;
+        physics_drop_turns = false;
     }
     if (e->_pose != NULL)
     {
         e->_pose->UpdateParameters(e->_model, dt);
-    }
-    if (before_model_update != NULL)
-    {
-        before_model_update(context);
     }
     if (e->carry_left_ms > 0.0f)
     {
@@ -784,6 +851,10 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
             e->_model->SetPartOpacity((csmInt32)i, v + (e->carry_parts[i] - v) * w);
         }
         e->carry_left_ms -= dt_ms;
+    }
+    if (before_model_update != NULL)
+    {
+        before_model_update(context);
     }
     copy_params(e, e->shown_params);
     e->shown_parts.resize(e->_model->GetPartCount());

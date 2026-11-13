@@ -199,7 +199,7 @@ def speech_motion(images):
 def mean_image(images):
     count = len(images)
     if not count:
-        return []
+        raise ValueError("no frames to average")
     return [sum(column) / count for column in zip(*images)]
 
 

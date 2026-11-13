@@ -21,13 +21,16 @@ extern "C" {
     pub fn engine_gpu_name(e: *mut Engine) -> *const c_char;
     pub fn engine_has_param(e: *mut Engine, id: *const c_char) -> bool;
     pub fn engine_param_get(e: *mut Engine, id: *const c_char) -> f32;
+    pub fn engine_param_at(e: *mut Engine, index: i32, minimum: *mut f32, maximum: *mut f32) -> *const c_char;
     pub fn engine_param_set(e: *mut Engine, id: *const c_char, value: f32);
+    pub fn engine_param_index(e: *mut Engine, id: *const c_char) -> i32;
+    pub fn engine_param_set_at(e: *mut Engine, index: i32, value: f32);
     pub fn engine_params_ahead(e: *mut Engine, ms: f32, ids: *const *const c_char, values: *mut f32, count: i32);
     pub fn engine_expression(e: *mut Engine, layer: i32, name: *const c_char) -> bool;
     pub fn engine_expression_add(e: *mut Engine, name: *const c_char, path: *const c_char) -> bool;
     pub fn engine_expression_keep(e: *mut Engine, name: *const c_char) -> bool;
     pub fn engine_expression_fade(e: *mut Engine, name: *const c_char, seconds: f32);
-    pub fn engine_physics_set(e: *mut Engine, strength: f32, wind: f32);
+    pub fn engine_physics_set(e: *mut Engine, strength: f32, wind: f32, wind_degrees: f32, gravity_degrees: f32);
     pub fn engine_physics_scale(e: *mut Engine, param_id: *const c_char, strength: f32, wind: f32);
     pub fn engine_expressions_stop(e: *mut Engine);
     pub fn engine_breath_enable(e: *mut Engine, on: bool);

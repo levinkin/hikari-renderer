@@ -227,7 +227,8 @@ static bool start_vulkan()
     pool_info.queueFamilyIndex = family;
     vkCreateCommandPool(device, &pool_info, NULL, &command_pool);
     static CubismFramework::Option option = {};
-    option.LoggingLevel = CubismFramework::Option::LogLevel_Off;
+    option.LogFunction = framework_log;
+    option.LoggingLevel = CubismFramework::Option::LogLevel_Warning;
     CubismFramework::StartUp(&allocator, &option);
     CubismFramework::Initialize();
     renderer_start(physical_device, device, queue, family, command_pool, color_format, &queue_lock);

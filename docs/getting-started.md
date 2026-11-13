@@ -56,28 +56,30 @@ numbers are all big-endian for faster comparisons/debugging.
 
 ## actions
 
-| endpoint | params (type, default) | what it does | returns |
-|---|---|---|---|
-| `GET /listen` | `codec` (string, `jpeg`), `fps` (integer, `60`), `size` (WxH, `size` setting) | streams idling until you close the connection. every listener sees the same picture | frame stream |
-| `POST /talk` | `codec`, `fps`, `size` (same as `/listen`). body: wav | lip syncs to the wav audio | frame stream |
-| `POST /state` | `face` (string), `pose` (string). leave one out to keep it | sets a face/pose and holds it | `{"face", "pose", "asleep"}`, `400` for an unknown state |
-| `GET /state` | none | the current face/pose, and every state this model has | `{"face", "pose", "asleep", "states": [...]}` |
-| `POST /action` | `action` (string, required) | plays an action then returns to idle | `{"action", "motion", "expression"}`, `400` for an unknown action |
-| `GET /action` | none | every action this model has, and the idle ones | `{"actions": [...], "idle": [...]}` |
+| endpoint | params (type, default) | what it does | returns | example |
+|---|---|---|---|---|
+| `GET /listen` | `codec` (string, `jpeg`), `fps` (integer, `60`), `size` (WxH, `size` setting) | streams idling until you close the connection. every listener sees the same picture | frame stream | `GET /listen?codec=jpeg&fps=30` |
+| `POST /talk` | `codec`, `fps`, `size` (same as `/listen`). body: wav | lip syncs to the wav audio | frame stream | `POST /talk?codec=qoi&size=320x240` with a wav body |
+| `POST /state` | `face` (string), `pose` (string). leave one out to keep it | sets a face/pose and holds it | `{"face", "pose", "asleep"}`, `400` for an unknown state | `POST /state?face=laughing` |
+| `GET /state` | none | the current face/pose, and every state this model has | `{"face", "pose", "asleep", "states": [...]}` | - |
+| `POST /action` | `action` (string, required) | plays an action then returns to idle | `{"action", "motion", "expression"}`, `400` for an unknown action | `POST /action?action=yawn` |
+| `GET /action` | none | every action this model has, and the idle ones | `{"actions": [...], "idle": [...]}` | - |
+| `POST /params` | none. body: json like `{"ParamAngleX": 10.0, "ParamMouthOpenY": 0.5}` | holds model params on top of idle and actions until changed, clamped to the model's range. `null` lets one go | every held param, `400` naming unknown params | `{"ParamAngleX": 10.0}` |
+| `POST /physics` | none. body: json with any of `strength` (number, `50`), `wind` (object with `strength`, number, `0` = off, `100` = vts max, and `direction`, degrees, `90`), `gravity` (object with `direction`, degrees, `0`). missing keys keep their value | changes physics live, in memory only. a model switch resets them to that model's values, then the `physics` setting | `{"strength", "wind": {"strength", "direction"}, "gravity": {"direction"}}`, `400` for an unknown key, a `wind`/`gravity` that isn't an object, or a non-number | `{"wind": {"strength": 100, "direction": 90}}` |
 
 ## misc endpoints
 
-| endpoint | params (type, default) | what it does | returns |
-|---|---|---|---|
-| `GET /models` | none | lists the models it found and the current one | `{"model": ..., "models": [...]}` |
-| `GET /view` | none | the model's current framing, its saved one and its default | `{"zoom", "x", "y", "rot", "saved", "default"}` (`saved` is `null` if never saved) |
-| `PUT /view` | `zoom`, `x`, `y`, `rot` (number, current value), `save` (bool, `false`) | moves the framing live. `save=true` also writes it to `views.json` | `204`, `500` if saving fails |
-| `GET /settings` | none | the current settings | json |
-| `PUT /settings` | json body with any of `model`, `face`, `idle_actions`, `action_every`, `idle_loop` | changes them live and saves them to `settings.json` | the new settings, `400` for a bad value or a restart-only key, `500` if `settings.json` can't be read or written |
-| `GET /background` | none | describes the current background | `{"kind", "name", "updated", ...}` |
-| `GET /background/file` | none | the background image itself | the image, or `404` |
-| `PUT /background` | none. body: a png, jpeg or gif | sets/switches a background from the body (5 MB max, animated gifs play) | 200, `400` if it isn't png/jpeg/gif or can't decode, `413` if too big |
-| `DELETE /background` | none | removes the background | 200 |
+| endpoint | params (type, default) | what it does | returns | example |
+|---|---|---|---|---|
+| `GET /models` | none | lists the models it found and the current one | `{"model": ..., "models": [...]}` | - |
+| `GET /view` | none | the model's current framing, its saved one and its default | `{"zoom", "x", "y", "rot", "saved", "default"}` (`saved` is `null` if never saved) | - |
+| `PUT /view` | `zoom`, `x`, `y`, `rot` (number, current value), `save` (bool, `false`) | moves the framing live. `save=true` also writes it to `views.json` | `204`, `500` if saving fails | `PUT /view?zoom=1.5&save=true` |
+| `GET /settings` | none | the current settings | json | - |
+| `PUT /settings` | json body with any of `model`, `face`, `idle_actions`, `action_every`, `rest_angle`, `physics` | changes them live and saves them to `settings.json` | the new settings, `400` for a bad value or a restart-only key, `500` if `settings.json` can't be read or written | `{"face": "neutral", "action_every": [10, 30]}` |
+| `GET /background` | none | describes the current background | `{"kind", "name", "updated", ...}` | - |
+| `GET /background/file` | none | the background image itself | the image, or `404` | - |
+| `PUT /background` | none. body: a png, jpeg or gif | sets/switches a background from the body (5 MB max, animated gifs play) | 200, `400` if it isn't png/jpeg/gif or can't decode, `413` if too big | a png body |
+| `DELETE /background` | none | removes the background | 200 | - |
 
 ## params
 | param | type | accepts | default |
@@ -133,11 +135,15 @@ in the frame stream, the picture after the codec byte depends on the codec:
 | `idle_actions` | list of strings | actions to pick from at random, `[]` for none | `["look_around", "glance_left", "glance_right", "double_blink", "yawn", "tilt_smile", "look_up_think"]` |
 | `action_every` | integer or `[min, max]` | whole seconds between idle actions, > 0. a pair waits a random time between the two | `15` |
 | `idle_loop` | string | an `Idle` motion name | the vtube studio idle animation, else the first `Idle` motion |
+| `rest_angle` | integer | 0 to 100, how far the robot's head tilts at rest (percent of its range) | `10` |
+| `physics` | object | same shape as the `POST /physics` body, any subset, e.g. `{"wind": {"strength": 40, "direction": 270}, "gravity": {"direction": 0}}`. used for models whose `.vtube.json` has no physics of its own (a model's own strength and wind win). directions always come from here | `{"strength": 50, "wind": {"strength": 0, "direction": 90}, "gravity": {"direction": 0}}` |
 
 actions are model3.json motion groups and vtube studio animation hotkeys, plus some default shipped ones in `default.model3.json` next to the launcher. edit that file to change them.
 
 states are `.exp3.json` expressions named by the model's vtube studio hotkey or file name, plus some default shipped ones in the same file.
 
-`port` and `size` need a restart.
+`port`, `size` and `idle_loop` need a restart.
+
+wind and gravity directions are compass degrees on the screen, top is north: the number says where the force comes from. `0` = from the top, flowing down. `90` = from the right, flowing left. `180` = from the bottom, flowing up. `270` = from the left, flowing right.
 
 one renderer runs one model. for more models, run a copy per model on its own port (`--port`).

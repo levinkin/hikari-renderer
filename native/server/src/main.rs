@@ -58,7 +58,10 @@ extern "C" {
 
 const SPLIT_SIZE: (usize, usize) = (320, 240);
 const MOUTHS: usize = 256;
+const REST_ANGLE_MAX: u64 = 100;
+const REST_ANGLE_DEFAULT: u64 = 10;
 const WINDOW_TURN_DEGREES: f32 = 90.0;
+const PHYSICS_DEFAULT: [f32; 4] = [50.0, 0.0, 90.0, 0.0];
 const MODEL_FRAMING: [f32; 4] = [f32::NAN; 4];
 const TARGET_IDLE: Duration = Duration::from_secs(10);
 const WAKE_MS: f32 = 1000.0;
@@ -86,6 +89,10 @@ struct App {
     state: Mutex<ModelState>,
     asleep: AtomicBool,
     head_lead_ms: AtomicU64,
+    params: Mutex<Vec<(String, i32, f32)>>,
+    physics: Mutex<Option<[f32; 4]>>,
+    settings_physics: Mutex<serde_json::Map<String, Value>>,
+    rest_angle: AtomicU64,
     shared: Mutex<Shared>,
     picture: (Mutex<Picture>, Condvar),
     lane_locks: [Mutex<()>; 3],
@@ -137,6 +144,8 @@ struct Model {
     states: Vec<String>,
     actions: Vec<String>,
     framing: Option<[f32; 4]>,
+    params: Vec<(String, f32, f32, i32)>,
+    physics: [f32; 4],
 }
 
 struct Scene {
@@ -161,6 +170,7 @@ struct LaneState {
     behavior: Behavior,
     framing: Option<[f32; 4]>,
     view: [f32; 4],
+    physics: [f32; 4],
     idle_generation: u64,
     state_generation: u64,
 }
@@ -335,6 +345,17 @@ fn iso_now() -> String {
 
 const STREAM_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
 const MJPEG_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+
+fn read_object(body: Body, out: &mut TcpStream, route: &str) -> Option<serde_json::Map<String, Value>> {
+    let mut text = String::new();
+    match body.take(65536).read_to_string(&mut text).ok().and_then(|_| serde_json::from_str(&text).ok()) {
+        Some(Value::Object(fields)) => Some(fields),
+        _ => {
+            send_body(out, 400, "text/plain", format!("hikari: {} needs a JSON object\n", route).as_bytes());
+            None
+        }
+    }
+}
 
 fn send_body(out: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
     let reason = match status {
@@ -603,7 +624,52 @@ fn put_view(app: &App, req: &Request, out: &mut TcpStream, save: bool) {
     send_body(out, 204, "", b"");
 }
 
-fn describe_model(name: &str, setup: &vtube::VtubeSetup, shipped: &[(String, PathBuf)], default_actions: &[(String, PathBuf)]) -> Model {
+fn physics_changes(fields: &serde_json::Map<String, Value>) -> Result<Vec<(usize, f32)>, String> {
+    let mut entries = Vec::new();
+    for (key, value) in fields {
+        if key == "strength" {
+            entries.push((key.clone(), value, 0));
+            continue;
+        }
+        if key != "wind" && key != "gravity" {
+            return Err(format!("hikari: unknown physics key {}", key));
+        }
+        let Some(inner) = value.as_object() else {
+            return Err(format!("hikari: {} must be an object", key));
+        };
+        for (name, inner_value) in inner {
+            let index = match (key.as_str(), name.as_str()) {
+                ("wind", "strength") => 1,
+                ("wind", "direction") => 2,
+                ("gravity", "direction") => 3,
+                _ => return Err(format!("hikari: unknown physics key {}.{}", key, name)),
+            };
+            entries.push((format!("{}.{}", key, name), inner_value, index));
+        }
+    }
+    let mut changes = Vec::new();
+    for (path, value, index) in entries {
+        match value.as_f64() {
+            Some(number) if (number as f32).is_finite() => changes.push((index, number as f32)),
+            _ => return Err(format!("hikari: {} must be a number within float range", path)),
+        }
+    }
+    Ok(changes)
+}
+
+fn effective_physics(own: Option<(f32, f32)>, fallback: &serde_json::Map<String, Value>) -> [f32; 4] {
+    let mut values = PHYSICS_DEFAULT;
+    for (index, value) in physics_changes(fallback).unwrap_or_default() {
+        values[index] = value;
+    }
+    if let Some((strength, wind)) = own {
+        values[0] = strength;
+        values[1] = wind;
+    }
+    values
+}
+
+fn describe_model(name: &str, setup: &vtube::VtubeSetup, shipped: &[(String, PathBuf)], default_actions: &[(String, PathBuf)], fallback: &serde_json::Map<String, Value>) -> Model {
     let mut states: Vec<String> = setup.states.iter().map(|(name, _)| name.clone()).chain(setup.state_files.iter().map(|(name, _)| name.clone())).chain(shipped.iter().map(|(name, _)| name.clone())).collect();
     states.sort();
     states.dedup();
@@ -611,7 +677,7 @@ fn describe_model(name: &str, setup: &vtube::VtubeSetup, shipped: &[(String, Pat
     actions.extend(default_actions.iter().map(|(name, _)| name.clone()));
     actions.sort();
     actions.dedup();
-    Model { name: name.to_string(), states, actions, framing: setup.framing }
+    Model { name: name.to_string(), states, actions, framing: setup.framing, params: Vec::new(), physics: effective_physics(setup.physics, fallback) }
 }
 
 fn post_state(app: &App, req: &Request, out: &mut TcpStream) {
@@ -651,6 +717,53 @@ fn post_state(app: &App, req: &Request, out: &mut TcpStream) {
     *current = state.clone();
     drop(current);
     send_body(out, 200, "application/json", json!({ "face": state.face, "pose": state.pose, "asleep": app.asleep.load(Ordering::SeqCst), "head_lead_ms": head_lead_ms }).to_string().as_bytes());
+}
+
+fn post_params(app: &App, body: Body, out: &mut TcpStream) {
+    let Some(fields) = read_object(body, out, "POST /params") else { return };
+    let model = app.model.lock().unwrap_or_else(PoisonError::into_inner);
+    let rows: Vec<_> = fields.iter().map(|(id, value)| (id, value, model.params.iter().find(|row| &row.0 == id))).collect();
+    let unknown: Vec<&str> = rows.iter().filter(|row| row.2.is_none()).map(|row| row.0.as_str()).collect();
+    if !unknown.is_empty() {
+        send_body(out, 400, "text/plain", format!("hikari: unknown params {}\n", unknown.join(",")).as_bytes());
+        return;
+    }
+    if let Some((id, _)) = fields.iter().find(|(_, value)| !value.is_null() && !value.is_number()) {
+        send_body(out, 400, "text/plain", format!("hikari: {} must be a number or null\n", id).as_bytes());
+        return;
+    }
+    let mut params = app.params.lock().unwrap_or_else(PoisonError::into_inner);
+    for (id, value, row) in &rows {
+        params.retain(|held| &held.0 != *id);
+        if let (Some(value), Some(row)) = (value.as_f64(), row) {
+            params.push(((*id).clone(), row.3, (value as f32).clamp(row.1, row.2)));
+        }
+    }
+    let held: serde_json::Map<String, Value> = params.iter().map(|(id, _, value)| (id.clone(), json!(value))).collect();
+    drop(params);
+    drop(model);
+    send_body(out, 200, "application/json", Value::Object(held).to_string().as_bytes());
+}
+
+fn post_physics(app: &App, body: Body, out: &mut TcpStream) {
+    let Some(fields) = read_object(body, out, "POST /physics") else { return };
+    let changes = match physics_changes(&fields) {
+        Ok(changes) => changes,
+        Err(line) => {
+            send_body(out, 400, "text/plain", format!("{}\n", line).as_bytes());
+            return;
+        }
+    };
+    let model = app.model.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut physics = app.physics.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut values = physics.unwrap_or(model.physics);
+    for (index, value) in changes {
+        values[index] = value;
+    }
+    *physics = Some(values);
+    drop(physics);
+    drop(model);
+    send_body(out, 200, "application/json", json!({ "strength": values[0], "wind": { "strength": values[1], "direction": values[2] }, "gravity": { "direction": values[3] } }).to_string().as_bytes());
 }
 
 fn handle_action(app: &App, out: &mut TcpStream, name: &str) {
@@ -956,6 +1069,17 @@ fn route(app: &App, req: &Request, body: Body, out: &mut TcpStream) {
             let idle = app.idle.lock().unwrap_or_else(PoisonError::into_inner).actions.clone();
             send_body(out, 200, "application/json", json!({ "actions": actions, "idle": idle }).to_string().as_bytes());
         }
+        ("POST", "/params") | ("POST", "/physics") => {
+            if !ready {
+                send_body(out, 503, "", b"");
+                return;
+            }
+            if req.path == "/params" {
+                post_params(app, body, out);
+            } else {
+                post_physics(app, body, out);
+            }
+        }
         ("GET", "/settings") => send_body(out, 200, "application/json", settings_json(app).to_string().as_bytes()),
         ("PUT", "/settings") => put_settings(app, body, out),
         (_, "/background") | (_, "/background/file") => handle_background(app, req, body, out, ready),
@@ -1226,29 +1350,49 @@ fn parse_idle(idle_actions: Option<&Value>, action_every: Option<&Value>, action
     Ok((known, every, unknown, banned))
 }
 
+fn read_rest_angle(value: Option<&Value>) -> Result<Option<u64>, &Value> {
+    let Some(value) = value else { return Ok(None) };
+    value.as_u64().filter(|angle| *angle <= REST_ANGLE_MAX).map(Some).ok_or(value)
+}
+
 fn settings_json(app: &App) -> Value {
     let idle = app.idle.lock().unwrap_or_else(PoisonError::into_inner);
-    json!({ "model": app.model.lock().unwrap_or_else(PoisonError::into_inner).name.clone(), "size": [app.size.0, app.size.1], "idle_actions": idle.actions, "action_every": idle.every, "face": idle.face, "idle_loop": idle.idle_loop })
+    json!({ "model": app.model.lock().unwrap_or_else(PoisonError::into_inner).name.clone(), "size": [app.size.0, app.size.1], "idle_actions": idle.actions, "action_every": idle.every, "face": idle.face, "idle_loop": idle.idle_loop, "rest_angle": app.rest_angle.load(Ordering::SeqCst), "physics": app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner).clone() })
 }
 
 fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
-    let mut text = String::new();
-    let fields = match body.take(65536).read_to_string(&mut text).ok().and_then(|_| serde_json::from_str(&text).ok()) {
-        Some(Value::Object(fields)) => fields,
-        _ => {
-            send_body(out, 400, "text/plain", b"hikari: PUT /settings needs a JSON object\n");
-            return;
-        }
-    };
+    let Some(fields) = read_object(body, out, "PUT /settings") else { return };
     let _settings_guard = app.settings_lock.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(key) = fields.keys().find(|key| ["size", "port", "idle_loop"].contains(&key.as_str())) {
         send_body(out, 400, "text/plain", format!("hikari: {} is restart-only, edit settings.json and restart\n", key).as_bytes());
         return;
     }
-    if let Some(key) = fields.keys().find(|key| !["idle_actions", "action_every", "model", "face"].contains(&key.as_str())) {
+    if let Some(key) = fields.keys().find(|key| !["idle_actions", "action_every", "model", "face", "rest_angle", "physics"].contains(&key.as_str())) {
         send_body(out, 400, "text/plain", format!("hikari: unknown setting {}\n", key).as_bytes());
         return;
     }
+    let rest_angle = match read_rest_angle(fields.get("rest_angle")) {
+        Ok(angle) => angle,
+        Err(other) => {
+            send_body(out, 400, "text/plain", format!("hikari: rest_angle must be an integer 0..{}, got {}\n", REST_ANGLE_MAX, other).as_bytes());
+            return;
+        }
+    };
+    let physics = match fields.get("physics") {
+        None => None,
+        Some(Value::Object(physics)) => match physics_changes(physics) {
+            Ok(_) => Some(physics.clone()),
+            Err(line) => {
+                send_body(out, 400, "text/plain", format!("{}\n", line).as_bytes());
+                return;
+            }
+        },
+        Some(_) => {
+            send_body(out, 400, "text/plain", b"hikari: physics must be an object\n");
+            return;
+        }
+    };
+    let rest_only = (rest_angle.is_some() || physics.is_some()) && fields.len() == rest_angle.iter().count() + physics.iter().count();
     let model = match fields.get("model") {
         None => None,
         Some(Value::String(name)) if app.models.contains_key(name) => Some(name.clone()),
@@ -1263,7 +1407,7 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
     };
     let current = app.model.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let target = match &model {
-        Some(name) if *name != current.name => describe_model(name, &vtube::load(&app.models[name]), &app.shipped, &app.default_actions),
+        Some(name) if *name != current.name => describe_model(name, &vtube::load(&app.models[name]), &app.shipped, &app.default_actions, &app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner)),
         _ => current,
     };
     let face = match fields.get("face") {
@@ -1341,7 +1485,12 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
     println!("hikari: idle actions={} action_every={}", actions.join(","), every);
     idle.actions = actions;
     idle.every = every;
-    idle.generation += 1;
+    if !rest_only {
+        idle.generation += 1;
+    }
+    if let Some(angle) = rest_angle {
+        app.rest_angle.store(angle, Ordering::SeqCst);
+    }
     if let Some(face) = face {
         idle.face = face.clone();
         let mut state = app.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1351,6 +1500,12 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
         }
     }
     drop(idle);
+    if let Some(physics) = physics {
+        let mut model = app.model.lock().unwrap_or_else(PoisonError::into_inner);
+        model.physics = effective_physics(vtube::load(&app.models[&model.name]).physics, &physics);
+        *app.physics.lock().unwrap_or_else(PoisonError::into_inner) = Some(model.physics);
+        *app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner) = physics;
+    }
     send_body(out, 200, "application/json", settings_json(app).to_string().as_bytes());
 }
 
@@ -1362,6 +1517,7 @@ fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)]) -> Option<(Vec<L
     println!("hikari: vtube model={} params={} expressions={} physics={}", name, setup.outputs.values().map(Vec::len).sum::<usize>(), setup.expressions.len(), physics);
     let view = model_view(&app.views.lock().unwrap_or_else(PoisonError::into_inner), name, setup.framing);
     println!("hikari: view model={} zoom={} x={} y={} rot={}", name, view[0], view[1], view[2], view[3]);
+    let physics = effective_physics(setup.physics, &app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner));
     let mut lanes: Vec<LaneState> = Vec::new();
     for &(width, height) in sizes {
         let engine = unsafe { engine_ffi::engine_create(model.as_ptr(), width as i32, height as i32) };
@@ -1378,9 +1534,7 @@ fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)]) -> Option<(Vec<L
                 unsafe { engine_ffi::engine_expression_fade(engine, id.as_ptr(), expression.fade_seconds) };
             }
         }
-        if let Some((strength, wind)) = setup.physics {
-            unsafe { engine_ffi::engine_physics_set(engine, strength, wind) };
-        }
+        unsafe { engine_ffi::engine_physics_set(engine, physics[0], physics[1], physics[2], physics[3]) };
         for (param, strength, wind) in &setup.physics_scales {
             if let Ok(id) = CString::new(param.as_str()) {
                 unsafe { engine_ffi::engine_physics_scale(engine, id.as_ptr(), *strength, *wind) };
@@ -1392,13 +1546,13 @@ fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)]) -> Option<(Vec<L
             }
         }
         let idle_loop = app.idle.lock().unwrap_or_else(PoisonError::into_inner).idle_loop.clone();
-        let mut behavior = Behavior::new(engine, &setup, &app.shipped, &app.default_actions, &idle_loop);
+        let mut behavior = Behavior::new(engine, &setup, &app.shipped, &app.default_actions, &idle_loop, app.rest_angle.load(Ordering::SeqCst) as f64);
         unsafe { engine_ffi::engine_view_set(engine, view[0], view[1], view[2], view[3]) };
         behavior.update(0.0, -1.0);
         unsafe { engine_ffi::engine_render(engine, behavior.bg_clock_ms as f32) };
         let gpu = unsafe { CStr::from_ptr(engine_ffi::engine_gpu_name(engine)) }.to_string_lossy().into_owned();
         println!("hikari: page ready gpu={}", gpu);
-        lanes.push(LaneState { width, height, engine, behavior, framing: setup.framing, view, idle_generation: 0, state_generation: 0 });
+        lanes.push(LaneState { width, height, engine, behavior, framing: setup.framing, view, physics, idle_generation: 0, state_generation: 0 });
     }
     for (id, output) in &lanes.first()?.behavior.remap {
         println!("hikari: vtube remap model={} {}->{}", name, id.to_string_lossy(), output.to_string_lossy());
@@ -1417,7 +1571,23 @@ fn build_scene(app: &App, name: &str) -> Option<Scene> {
         return None;
     };
     println!("hikari: model {} ready ms={}", name, started.elapsed().as_millis());
-    Some(Scene { model: describe_model(name, &setup, &app.shipped, &app.default_actions), lanes, targets: HashMap::new(), asleep: false })
+    let mut model = describe_model(name, &setup, &app.shipped, &app.default_actions, &app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner));
+    let (mut minimum, mut maximum) = (0.0f32, 0.0f32);
+    let mut index = 0;
+    loop {
+        let id = unsafe { engine_ffi::engine_param_at(lanes[0].engine, index, &mut minimum, &mut maximum) };
+        if id.is_null() {
+            break;
+        }
+        model.params.push((unsafe { CStr::from_ptr(id) }.to_string_lossy().into_owned(), minimum, maximum, index));
+        index += 1;
+    }
+    for (id, output) in &lanes[0].behavior.remap {
+        if let Some(row) = model.params.iter().find(|row| row.0.as_bytes() == output.as_bytes()).cloned() {
+            model.params.push((id.to_string_lossy().into_owned(), row.1, row.2, row.3));
+        }
+    }
+    Some(Scene { model, lanes, targets: HashMap::new(), asleep: false })
 }
 
 fn drop_scene(app: &App, scene: Scene) {
@@ -1487,6 +1657,14 @@ impl Scene {
         sync_idle(app, state);
         sync_state(app, state);
         state.behavior.head_lead_ms = app.head_lead_ms.load(Ordering::SeqCst) as f32;
+        state.behavior.params.clear();
+        state.behavior.params.extend(app.params.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|row| (row.1, row.2)));
+        state.behavior.rest_angle = app.rest_angle.load(Ordering::SeqCst) as f64;
+        let physics = app.physics.lock().unwrap_or_else(PoisonError::into_inner).unwrap_or(self.model.physics);
+        if physics != state.physics {
+            unsafe { engine_ffi::engine_physics_set(state.engine, physics[0], physics[1], physics[2], physics[3]) };
+            state.physics = physics;
+        }
         state.view = model_view(&app.views.lock().unwrap_or_else(PoisonError::into_inner), &name, state.framing);
     }
 
@@ -1588,7 +1766,11 @@ fn run_render(app: Arc<App>, jobs: Receiver<Job>, port: u16) {
                 shared.engine = scene.lanes[Lane::Shared as usize].engine as usize;
                 shared.name = model.clone();
                 shared.bg_clock_ms = 0.0;
-                *app.model.lock().unwrap_or_else(PoisonError::into_inner) = scene.model.clone();
+                let mut current = app.model.lock().unwrap_or_else(PoisonError::into_inner);
+                *current = scene.model.clone();
+                app.params.lock().unwrap_or_else(PoisonError::into_inner).clear();
+                *app.physics.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                drop(current);
                 app.views.lock().unwrap_or_else(PoisonError::into_inner).live.remove(&model);
                 let face = app.idle.lock().unwrap_or_else(PoisonError::into_inner).face.clone();
                 let mut state = app.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1741,7 +1923,12 @@ fn main() {
     });
     let name = setting_model(&settings, &models);
     let setup = vtube::load(&models[&name]);
-    let model = describe_model(&name, &setup, &shipped, &default_actions);
+    let mut settings_physics = settings["physics"].as_object().cloned().unwrap_or_default();
+    if settings.get("physics").is_some() && (!settings["physics"].is_object() || physics_changes(&settings_physics).is_err()) {
+        println!("hikari: settings.json physics {} is not valid, using the defaults", settings["physics"]);
+        settings_physics = serde_json::Map::new();
+    }
+    let model = describe_model(&name, &setup, &shipped, &default_actions, &settings_physics);
     let (idle_actions, action_every, unknown, banned) = parse_idle(settings.get("idle_actions"), settings.get("action_every"), &[], &json!(15), &model.actions).unwrap_or_else(|line| {
         eprintln!("{}", line);
         std::process::exit(1);
@@ -1763,6 +1950,13 @@ fn main() {
         println!("hikari: settings.json idle_loop {} is not an idle motion, using the default", settings["idle_loop"]);
         idle_loop = String::new();
     }
+    let rest_angle = match read_rest_angle(settings.get("rest_angle")) {
+        Ok(angle) => angle.unwrap_or(REST_ANGLE_DEFAULT),
+        Err(other) => {
+            println!("hikari: settings.json rest_angle {} is not an integer 0..{}, using {}", other, REST_ANGLE_MAX, REST_ANGLE_DEFAULT);
+            REST_ANGLE_DEFAULT
+        }
+    };
     let now = Instant::now();
     let app = Arc::new(App {
         jobs,
@@ -1784,6 +1978,10 @@ fn main() {
         state: Mutex::new(ModelState { face, pose: "none".to_string(), face_given: false, generation: 1 }),
         asleep: AtomicBool::new(false),
         head_lead_ms: AtomicU64::new(0),
+        params: Mutex::new(Vec::new()),
+        physics: Mutex::new(None),
+        settings_physics: Mutex::new(settings_physics),
+        rest_angle: AtomicU64::new(rest_angle),
         shared: Mutex::new(Shared { engine: 0, name: String::new(), window: String::new(), pending: Vec::new(), bg_clock_ms: 0.0 }),
         picture: (Mutex::new(Picture { seq: 0, head: [0; 4], frames: HashMap::new(), wants: Vec::new(), window_fps: 0.0 }), Condvar::new()),
         lane_locks: Default::default(),

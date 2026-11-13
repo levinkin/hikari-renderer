@@ -61,6 +61,7 @@ struct renderer
     uint32_t mask_tiles = 1;
     uint32_t mask_side = 0;
     bool blend = false;
+    bool tiled = false;
     VkExtent2D extent{};
     gpu_image color;
     gpu_image resolved;

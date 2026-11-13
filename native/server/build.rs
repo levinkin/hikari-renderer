@@ -78,6 +78,30 @@ fn embed_metal(framework_dir: &Path, out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", shader_dir.display());
 }
 
+fn patch_physics(framework_dir: &Path, out_dir: &Path) -> Option<PathBuf> {
+    let source_path = framework_dir.join("Physics/CubismPhysics.cpp");
+    let mut source = fs::read_to_string(&source_path).unwrap();
+    for indent in ["            ", "                "] {
+        let anchor = format!("{indent}    _options.Gravity\n{indent});\n");
+        if source.matches(anchor.as_str()).count() != 1 {
+            println!("cargo::error={} does not match the angle unwrap patch: hikari expects Cubism SDK for Native 5-r.5", source_path.display());
+            return None;
+        }
+        let unwrapped = format!("{anchor}{indent}csmFloat32 step = outputValue - _currentRigOutputs[settingIndex].outputs[i];\n{indent}if (currentOutputs[i].GetValue == GetOutputAngle && std::fabs(step) > CubismMath::Pi)\n{indent}{{\n{indent}    csmFloat32 unwrapped = _currentRigOutputs[settingIndex].outputs[i] + std::remainder(step, 2.0f * CubismMath::Pi);\n{indent}    if (physics_drop_turns)\n{indent}    {{\n{indent}        _previousRigOutputs[settingIndex].outputs[i] += outputValue - unwrapped;\n{indent}    }}\n{indent}    else\n{indent}    {{\n{indent}        outputValue = unwrapped;\n{indent}    }}\n{indent}}}\n");
+        source = source.replacen(anchor.as_str(), &unwrapped, 1);
+    }
+    let substep = "        _currentRemainTime -= physicsDeltaTime;\n";
+    let header = "#include \"CubismPhysics.hpp\"\n";
+    if source.matches(substep).count() != 1 || source.matches(header).count() != 1 {
+        println!("cargo::error={} does not match the turn drop patch: hikari expects Cubism SDK for Native 5-r.5", source_path.display());
+        return None;
+    }
+    source = source.replacen(substep, &format!("        physics_drop_turns = false;\n{substep}"), 1).replacen(header, &format!("{header}thread_local bool physics_drop_turns = false;\n"), 1);
+    let patched = out_dir.join("CubismPhysics.cpp");
+    fs::write(&patched, source).unwrap();
+    Some(patched)
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest_dir.parent().unwrap().parent().unwrap().to_path_buf();
@@ -122,9 +146,12 @@ fn main() {
     }
     let sdk_define = format!("\"{}\"", sdk_root.display().to_string().replace('\\', "/"));
     let core_include = sdk_root.join("Core/include");
+    let Some(physics_source) = patch_physics(&framework_dir, &out_dir) else {
+        return;
+    };
     if target_os == "macos" || target_os == "ios" {
-        let mut framework_sources = Vec::new();
-        collect_sources(&framework_dir, &["D3D9", "D3D11", "OpenGL", "Vulkan", "Metal", "build"], &mut framework_sources);
+        let mut framework_sources = vec![physics_source];
+        collect_sources(&framework_dir, &["D3D9", "D3D11", "OpenGL", "Vulkan", "Metal", "build", "CubismPhysics.cpp"], &mut framework_sources);
         embed_metal(&framework_dir, &out_dir);
         framework_sources.push(engine_dir.join("core_loader.cpp"));
         cc::Build::new()
@@ -148,6 +175,7 @@ fn main() {
             .flag("-fno-objc-arc")
             .define("HIKARI_SDK", sdk_define.as_str())
             .include(&framework_dir)
+            .include(framework_dir.join("Physics"))
             .include(&core_include)
             .warnings(false)
             .files(&framework_sources)
@@ -182,8 +210,8 @@ fn main() {
             }
         }
     } else {
-        let mut framework_sources = vec![framework_dir.join("Rendering/Vulkan/CubismClass_Vulkan.cpp")];
-        collect_sources(&framework_dir, &["D3D9", "D3D11", "OpenGL", "Metal", "Vulkan"], &mut framework_sources);
+        let mut framework_sources = vec![framework_dir.join("Rendering/Vulkan/CubismClass_Vulkan.cpp"), physics_source];
+        collect_sources(&framework_dir, &["D3D9", "D3D11", "OpenGL", "Metal", "Vulkan", "CubismPhysics.cpp"], &mut framework_sources);
         framework_sources.push(engine_dir.join("core_loader.cpp"));
         let mut engine = cc::Build::new();
         let mut framework = cc::Build::new();
@@ -194,7 +222,7 @@ fn main() {
             }
         }
         engine.include(&engine_dir).include(sdk_root.join("Samples/Vulkan/thirdParty/stb")).file(engine_dir.join("engine_vk.cpp")).file(engine_dir.join("renderer_vk.cpp")).file(engine_dir.join("kqueue_compat.cpp")).file(engine_dir.join(if target_os == "windows" { "window_win32.cpp" } else { "window_x11.cpp" })).compile("hikari_engine");
-        framework.define("HIKARI_SDK", sdk_define.as_str()).files(&framework_sources).compile("cubism_framework");
+        framework.define("HIKARI_SDK", sdk_define.as_str()).include(framework_dir.join("Physics")).files(&framework_sources).compile("cubism_framework");
         if target_os == "windows" {
             let target = env::var("TARGET").unwrap();
             let lib_exe = cc::windows_registry::find_tool(&target, "lib.exe").expect("lib.exe from visual studio build tools");

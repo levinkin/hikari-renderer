@@ -235,6 +235,7 @@ struct metal_renderer
     id<MTLTexture> mask_texture = nil;
     id<MTLTexture> msaa = nil;
     bool blend = false;
+    bool tiled = false;
     uint32_t mask_tiles = 1;
     uint32_t mask_side = 0;
     std::vector<id<MTLTexture>> layers;
@@ -467,14 +468,19 @@ metal_renderer* metal_renderer_create(CubismModel* model, const std::vector<id<M
         r->offscreen_masks = new mask_manager();
         r->offscreen_masks->Initialize(*model, 1, CubismRenderer::DrawableObjectType_Offscreen);
     }
+    r->tiled = r->blend;
+    for (mask_manager* manager : {r->masks, r->offscreen_masks})
+    {
+        r->tiled = r->tiled || (manager != NULL && manager->mask_list().GetSize() > (csmUint32)ClippingMaskMaxCountOnDefault);
+    }
     uint32_t tiles = 0;
     for (mask_manager* manager : {r->masks, r->offscreen_masks})
     {
         for (csmUint32 i = 0; manager != NULL && i < manager->mask_list().GetSize(); i++)
         {
-            manager->mask_list()[i]->tile = r->blend ? tiles + i : tiles;
+            manager->mask_list()[i]->tile = r->tiled ? tiles + i : tiles;
         }
-        tiles += manager == NULL ? 0 : (r->blend ? manager->mask_list().GetSize() : 1);
+        tiles += manager == NULL ? 0 : (r->tiled ? manager->mask_list().GetSize() : 1);
     }
     r->mask_tiles = std::max<uint32_t>(tiles, 1);
     csmInt32 offscreens = model->GetOffscreenCount();
@@ -503,7 +509,7 @@ metal_renderer* metal_renderer_create(CubismModel* model, const std::vector<id<M
     {
         reason = "offscreen nesting exceeds the color attachment limit";
     }
-    else if (r->blend && r->mask_tiles * 256 > max_texture_side)
+    else if (r->tiled && r->mask_tiles * 256 > max_texture_side)
     {
         reason = "mask atlas exceeds the texture size limit";
     }
@@ -575,7 +581,7 @@ static void size_masks(metal_renderer* renderer, id<MTLTexture> target, CubismMa
     CubismModel* model = renderer->model;
     const float* mvp = projection.GetArray();
     uint32_t side = 256;
-    if (renderer->blend)
+    if (renderer->tiled)
     {
         while (side < std::max(target.width, target.height) && side < 2048)
         {
@@ -603,12 +609,12 @@ static void size_masks(metal_renderer* renderer, id<MTLTexture> target, CubismMa
     renderer->mask_side = side;
     for (mask_manager* manager : {renderer->masks, renderer->offscreen_masks})
     {
-        if (manager != NULL && !renderer->blend)
+        if (manager != NULL && !renderer->tiled)
         {
             manager->SetClippingMaskBufferSize(side, side);
         }
     }
-    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:side height:renderer->blend ? side * renderer->mask_tiles : side mipmapped:NO];
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:side height:renderer->tiled ? side * renderer->mask_tiles : side mipmapped:NO];
     descriptor.storageMode = MTLStorageModePrivate;
     descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     renderer->mask_texture = [renderer_device newTextureWithDescriptor:descriptor];
@@ -621,7 +627,7 @@ static void draw_masks(metal_renderer* r, id<MTLCommandBuffer> command_buffer, i
     for (mask_manager* manager : {r->masks, r->offscreen_masks})
     {
         CubismRenderer::DrawableObjectType type = manager == r->offscreen_masks ? CubismRenderer::DrawableObjectType_Offscreen : CubismRenderer::DrawableObjectType_Drawable;
-        if (manager == NULL || manager->layout(*r->model, type, r->blend, type == CubismRenderer::DrawableObjectType_Offscreen ? mvp : CubismMatrix44()) == 0)
+        if (manager == NULL || manager->layout(*r->model, type, r->tiled, type == CubismRenderer::DrawableObjectType_Offscreen ? mvp : CubismMatrix44()) == 0)
         {
             continue;
         }
@@ -635,11 +641,11 @@ static void draw_masks(metal_renderer* r, id<MTLCommandBuffer> command_buffer, i
         for (csmUint32 c = 0; c < manager->mask_list().GetSize(); c++)
         {
             mask_context* context = manager->mask_list()[c];
-            if (r->blend && !context->_isUsing)
+            if (r->tiled && !context->_isUsing)
             {
                 continue;
             }
-            if (r->blend)
+            if (r->tiled)
             {
                 [encoder setViewport:(MTLViewport){0, (double)(context->tile * r->mask_side), (double)r->mask_side, (double)r->mask_side, 0, 1}];
             }
@@ -836,6 +842,10 @@ void metal_renderer_draw(metal_renderer* r, id<MTLCommandBuffer> command_buffer,
             {
                 set_channel(r->masks, context, uniforms);
                 uniforms.clipMatrix = simd_matrix(context->_matrixForDraw);
+                for (int column = 0; r->tiled && column < 4; column++)
+                {
+                    uniforms.clipMatrix.columns[column].y = (uniforms.clipMatrix.columns[column].y + uniforms.clipMatrix.columns[column].w * (r->mask_tiles - context->tile - 1)) / r->mask_tiles;
+                }
             }
             uniforms.matrix = matrix;
             set_colors(uniforms, model->GetDrawableOpacity(index), colors.GetDrawableMultiplyColor(index), colors.GetDrawableScreenColor(index));

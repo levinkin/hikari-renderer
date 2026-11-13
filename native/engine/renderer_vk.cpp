@@ -1228,15 +1228,20 @@ renderer* renderer_create(CubismModel* model, const std::vector<VkDescriptorImag
         r->offscreen_masks = new mask_manager();
         r->offscreen_masks->Initialize(*model, 1, CubismRenderer::DrawableObjectType_Offscreen);
     }
+    r->tiled = r->blend;
+    for (mask_manager* manager : {r->drawable_masks, r->offscreen_masks})
+    {
+        r->tiled = r->tiled || (manager != NULL && manager->_clippingContextListForMask.GetSize() > (csmUint32)Rendering::ClippingMaskMaxCountOnDefault);
+    }
     uint32_t tiles = 0;
     for (mask_manager* manager : {r->drawable_masks, r->offscreen_masks})
     {
         for (csmUint32 i = 0; manager != NULL && i < manager->_clippingContextListForMask.GetSize(); i++)
         {
             draws += (uint32_t)manager->_clippingContextListForMask[i]->_clippingIdCount;
-            manager->_clippingContextListForMask[i]->tile = r->blend ? tiles + i : tiles;
+            manager->_clippingContextListForMask[i]->tile = r->tiled ? tiles + i : tiles;
         }
-        tiles += manager == NULL ? 0 : (r->blend ? manager->_clippingContextListForMask.GetSize() : 1);
+        tiles += manager == NULL ? 0 : (r->tiled ? manager->_clippingContextListForMask.GetSize() : 1);
     }
     r->mask_tiles = std::max<uint32_t>(tiles, 1);
     r->mask_side = min_mask_side;
@@ -1535,14 +1540,14 @@ static void set_clip(draw_data* data, mask_manager* manager, mask_context* clip)
 static void draw_masks(renderer* r, VkCommandBuffer commands, mask_manager* manager, CubismRenderer::DrawableObjectType type, const CubismMatrix44& mvp, uint32_t side)
 {
     CubismModel* model = r->model;
-    if (manager == NULL || manager->layout(*model, type, r->blend, type == CubismRenderer::DrawableObjectType_Offscreen ? mvp : CubismMatrix44()) <= 0)
+    if (manager == NULL || manager->layout(*model, type, r->tiled, type == CubismRenderer::DrawableObjectType_Offscreen ? mvp : CubismMatrix44()) <= 0)
     {
         return;
     }
     for (csmUint32 i = 0; i < manager->_clippingContextListForMask.GetSize(); i++)
     {
         mask_context* context = manager->_clippingContextListForMask[i];
-        if (r->blend && !context->_isUsing)
+        if (r->tiled && !context->_isUsing)
         {
             continue;
         }
@@ -1713,7 +1718,7 @@ void renderer_draw(renderer* r, VkCommandBuffer commands, VkExtent2D extent, con
     ensure_targets(r, extent);
     mask_manager* masks = r->drawable_masks != NULL ? r->drawable_masks : r->offscreen_masks;
     uint32_t side = min_mask_side;
-    if (masks != NULL && r->blend)
+    if (masks != NULL && r->tiled)
     {
         side = tile_side(r);
     }
@@ -1726,17 +1731,17 @@ void renderer_draw(renderer* r, VkCommandBuffer commands, VkExtent2D extent, con
         {
             side *= 2;
         }
-        if (side != r->mask_side)
+    }
+    if (masks != NULL && side != r->mask_side)
+    {
+        vkWaitForFences(device, 2, r->fences, VK_TRUE, UINT64_MAX);
+        make_mask(r, side);
+        r->mask_side = side;
+        for (mask_manager* manager : {r->drawable_masks, r->offscreen_masks})
         {
-            vkWaitForFences(device, 2, r->fences, VK_TRUE, UINT64_MAX);
-            make_mask(r, side);
-            r->mask_side = side;
-            for (mask_manager* manager : {r->drawable_masks, r->offscreen_masks})
+            if (manager != NULL && !r->tiled)
             {
-                if (manager != NULL)
-                {
-                    manager->SetClippingMaskBufferSize((float)side, (float)side);
-                }
+                manager->SetClippingMaskBufferSize((float)side, (float)side);
             }
         }
     }

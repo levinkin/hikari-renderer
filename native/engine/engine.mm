@@ -82,7 +82,8 @@ static bool start_metal()
         return false;
     }
     static CubismFramework::Option option = {};
-    option.LoggingLevel = CubismFramework::Option::LogLevel_Off;
+    option.LogFunction = framework_log;
+    option.LoggingLevel = CubismFramework::Option::LogLevel_Warning;
     CubismFramework::StartUp(&allocator, &option);
     CubismFramework::Initialize();
     return true;
