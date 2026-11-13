@@ -221,7 +221,7 @@ impl Behavior {
 
     fn capture_head(&mut self, head: [f32; 2]) {
         let (angle_x, angle_y) = (head[0] as f64, head[1] as f64);
-        let target = if self.asleep { [0.0, PITCH_HOME] } else { [(-angle_x / YAW_PER_ANGLE_X * 10.0).clamp(-800.0, 800.0), (PITCH_HOME + angle_y / PITCH_PER_ANGLE_Y * 10.0).clamp(0.0, 600.0)] };
+        let target = if self.asleep { [0.0, 0.0] } else { [(-angle_x / YAW_PER_ANGLE_X * 10.0).clamp(-800.0, 800.0), (PITCH_HOME + angle_y / PITCH_PER_ANGLE_Y * 10.0).clamp(0.0, 600.0)] };
         let blend = 1.0 - (-self.head_dt_ms / HEAD_SMOOTH_MS).exp();
         self.head_at[0] += (target[0] - self.head_at[0]) * blend;
         self.head_at[1] += (target[1] - self.head_at[1]) * blend;
