@@ -4,6 +4,17 @@ the hikari renderer draws a live2d model and streams the frames over http or sho
 
 [getting started](docs/getting-started.md) has setup, running it and the http api.
 
+## what it does differently
+
+- no browser or game engine. it draws straight on metal (mac) or vulkan (windows/linux), so the whole thing is 1.1-1.6 MB.
+- every window/stream showing the same model shares one gpu copy of its textures.
+- it bc7-compresses each texture (4x less gpu memory) only if the result stays visually identical (mean error ≤ 1 and max ≤ 160 out of 255, measured per texture). otherwise the texture stays uncompressed.
+- a stream at a different size than the main view gets its own copy of the model. the main view used to update its model every frame even when nothing drew it. now it skips that (0.86 → 0.67 ms per frame on an m6, frames byte-identical).
+
+### how i got there
+
+i profiled a frame before changing anything. drawing is 61-76% of it and physics is under 0.5%, so physics stays as is. the profile also showed the model updating twice per frame whenever a stream ran at another size, which is where the skip came from.
+
 ## numbers
 
 ### against vtube studio
