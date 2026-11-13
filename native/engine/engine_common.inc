@@ -98,6 +98,7 @@ struct engine : public CubismUserModel, public engine_gpu
     std::vector<ACubismMotion*>* idle = NULL;
     bool idle_paused = false;
     uint32_t motion_seed = 0;
+    unsigned int blink_seed = 1;
     csmVector<CubismIdHandle> blink_ids;
     csmVector<CubismIdHandle> lip_ids;
     std::vector<float> blink_open;
@@ -397,6 +398,7 @@ static engine* load_model(const std::string& path, const std::string& dir, int w
         phase = (seed >> 8) * (6.2831853f / 16777216.0f);
     }
     e->motion_seed = seed;
+    e->blink_seed = seed * 1664525u + 1013904223u;
     return e;
 }
 
@@ -630,6 +632,7 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
         e->_motionManager->StartMotionPriority(motion_pick(e, *e->idle), false, 1);
     }
     e->rest_marks.assign(e->_model->GetParameterCount(), 0);
+    bool eyes_held = false;
     if (e->idle != NULL)
     {
         for (ACubismMotion* motion : *e->idle)
@@ -650,6 +653,12 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
         }
         ACubismMotion* motion = entry->GetCubismMotion();
         char mark = entry->IsTriggeredFadeOut() || (entry->GetEndTime() >= 0.0f && entry->GetStateTime() >= entry->GetEndTime() - motion->GetFadeOutTime()) ? 1 : 2;
+        bool idle_motion = e->idle != NULL && std::find(e->idle->begin(), e->idle->end(), motion) != e->idle->end();
+        for (csmUint32 b = 0; mark == 2 && !idle_motion && b < e->blink_ids.GetSize(); b++)
+        {
+            csmInt32 blink_index = e->_model->GetParameterIndex(e->blink_ids[b]);
+            eyes_held = eyes_held || std::find(e->motion_params[motion].begin(), e->motion_params[motion].end(), blink_index) != e->motion_params[motion].end();
+        }
         for (csmInt32 index : e->motion_params[motion])
         {
             e->rest_marks[index] = std::max(e->rest_marks[index], mark);
@@ -681,23 +690,28 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
     {
         kept->UpdateMotion(e->_model, dt);
     }
-    if (!motion_updated && e->_eyeBlink != NULL)
+    if (e->_eyeBlink != NULL && !eyes_held)
     {
-        e->_eyeBlink->UpdateParameters(e->_model, dt);
-    }
-    else if (e->_eyeBlink != NULL)
-    {
-        const csmVector<CubismIdHandle>& ids = e->_eyeBlink->GetParameterIds();
-        e->blink_open.resize(ids.GetSize());
-        for (csmUint32 i = 0; i < ids.GetSize(); i++)
+        srand(e->blink_seed);
+        if (!motion_updated)
         {
-            e->blink_open[i] = e->_model->GetParameterValue(ids[i]);
+            e->_eyeBlink->UpdateParameters(e->_model, dt);
         }
-        e->_eyeBlink->UpdateParameters(e->_model, dt);
-        for (csmUint32 i = 0; i < ids.GetSize(); i++)
+        else
         {
-            e->_model->SetParameterValue(ids[i], e->blink_open[i] * e->_model->GetParameterValue(ids[i]));
+            const csmVector<CubismIdHandle>& ids = e->_eyeBlink->GetParameterIds();
+            e->blink_open.resize(ids.GetSize());
+            for (csmUint32 i = 0; i < ids.GetSize(); i++)
+            {
+                e->blink_open[i] = e->_model->GetParameterValue(ids[i]);
+            }
+            e->_eyeBlink->UpdateParameters(e->_model, dt);
+            for (csmUint32 i = 0; i < ids.GetSize(); i++)
+            {
+                e->_model->SetParameterValue(ids[i], e->blink_open[i] * e->_model->GetParameterValue(ids[i]));
+            }
         }
+        e->blink_seed = (unsigned int)rand();
     }
     e->_breath->UpdateParameters(e->_model, dt);
     if (e->_physics != NULL)
