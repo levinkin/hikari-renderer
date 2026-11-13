@@ -1,10 +1,8 @@
 # hikari renderer
 
-the hikari renderer draws a live2d model and streams the frames over http, or shows it in its own window. i built it for my stackchan robot, whose face comes from here. it runs on metal on mac and vulkan on windows and linux, as one small binary per os.
+the hikari renderer draws a live2d model and streams the frames over http or shows it in its own window. i built it to be as light weight as possible without sacrificing speed or quality. it runs on metal on mac and vulkan on windows and linux.
 
-## getting started
-
-grab the zip for your system from the [releases page](https://github.com/levinkin/hikari-renderer/releases), unzip it, put live2d's [cubism sdk for native](https://www.live2d.com/en/sdk/download/native/) next to the `hikari` launcher as `sdk/`, and double-click `hikari`. the first run builds it on your machine, since live2d doesn't let me ship their sdk inside a build. [getting started](docs/getting-started.md) has the install commands for each os, the window and headless modes, the frame format for pulling frames yourself, and the http api.
+[getting started](docs/getting-started.md) has setup, running it and the http api.
 
 ## numbers
 
