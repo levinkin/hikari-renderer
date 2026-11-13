@@ -1,0 +1,15 @@
+[package]
+name = "hikari-launcher"
+version = "0.3.0"
+edition = "2021"
+
+[[bin]]
+name = "hikari"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
