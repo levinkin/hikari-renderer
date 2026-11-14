@@ -4,15 +4,10 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-pub struct VtubeExpression {
-    pub file_stem: String,
-    pub fade_seconds: f32,
-}
-
 #[derive(Default)]
 pub struct VtubeSetup {
     pub outputs: HashMap<String, Vec<String>>,
-    pub expressions: Vec<VtubeExpression>,
+    pub expressions: Vec<String>,
     pub active_expressions: Vec<String>,
     pub physics: Option<(f32, f32)>,
     pub physics_scales: Vec<(String, f32, f32)>,
@@ -246,10 +241,7 @@ pub fn load(model3_path: &Path) -> VtubeSetup {
             (Some("ToggleExpression"), _) => {
                 let Some(file) = hotkey["File"].as_str() else { continue };
                 add_state(&mut setup.states, name, &file_stem(file));
-                setup.expressions.push(VtubeExpression {
-                    file_stem: file_stem(file),
-                    fade_seconds: hotkey["FadeSecondsAmount"].as_f64().map(|v| v as f32).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.5),
-                });
+                setup.expressions.push(file_stem(file));
             }
             _ => {}
         }

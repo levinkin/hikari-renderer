@@ -22,7 +22,6 @@ static VTS_INPUTS: [(&CStr, &str); 12] = [
 ];
 
 const YAW_PER_ANGLE_X: f64 = 0.6;
-const PITCH_PER_REST_ANGLE: f64 = 6.0;
 const PITCH_PER_ANGLE_Y: f64 = 0.5;
 const HEAD_SMOOTH_MS: f64 = 80.0;
 const HEAD_TURN_SCALE: f32 = 0.6;
@@ -46,7 +45,6 @@ pub struct Behavior {
     pub head_lead_ms: f32,
     pub params: Vec<(i32, f32)>,
     head_indices: [i32; 3],
-    pub rest_angle: f64,
 }
 
 fn random_u32() -> u32 {
@@ -96,7 +94,7 @@ extern "C" fn apply_mouth(context: *mut c_void) {
 }
 
 impl Behavior {
-    pub fn new(engine: *mut engine_ffi::Engine, setup: &VtubeSetup, shipped: &[(String, PathBuf)], actions: &[(String, PathBuf)], idle_loop: &str, rest_angle: f64) -> Behavior {
+    pub fn new(engine: *mut engine_ffi::Engine, setup: &VtubeSetup, shipped: &[(String, PathBuf)], actions: &[(String, PathBuf)], idle_loop: &str) -> Behavior {
         let mut remap: Vec<(&'static CStr, CString)> = Vec::new();
         for (id, input) in VTS_INPUTS {
             if unsafe { engine_ffi::engine_has_param(engine, id.as_ptr()) } {
@@ -130,8 +128,6 @@ impl Behavior {
         let own_idle = loop_file.is_some_and(|file| unsafe { engine_ffi::engine_motion_add(engine, file.as_ptr(), file.as_ptr()) && engine_ffi::engine_motion_idle(engine, file.as_ptr()) });
         unsafe { engine_ffi::engine_idle_motions_enable(engine, true) };
         let head_indices = [c"ParamAngleX", c"ParamAngleY", c"ParamAngleZ"].map(|id| unsafe { engine_ffi::engine_param_index(engine, param_ptr(&remap, id)) });
-        let pitch_home = rest_angle * PITCH_PER_REST_ANGLE;
-        let pitch = (pitch_home.round() as i16).to_be_bytes();
         Behavior {
             engine,
             remap,
@@ -145,13 +141,12 @@ impl Behavior {
             random_wait_ms: -1.0,
             pool: Vec::new(),
             action_every_ms: (15000.0, 15000.0),
-            head: [0, 0, pitch[0], pitch[1]],
-            head_at: [0.0, pitch_home],
+            head: [0; 4],
+            head_at: [0.0; 2],
             head_dt_ms: 0.0,
             head_lead_ms: 0.0,
             params: Vec::new(),
             head_indices,
-            rest_angle,
         }
     }
 
@@ -239,7 +234,7 @@ impl Behavior {
 
     fn capture_head(&mut self, head: [f32; 2]) {
         let (angle_x, angle_y) = (head[0] as f64, head[1] as f64);
-        let target = if self.asleep { [0.0, 0.0] } else { [(-angle_x / YAW_PER_ANGLE_X * 10.0).clamp(-800.0, 800.0), (self.rest_angle * PITCH_PER_REST_ANGLE + angle_y / PITCH_PER_ANGLE_Y * 10.0).clamp(0.0, 600.0)] };
+        let target = if self.asleep { [0.0, 0.0] } else { [(-angle_x / YAW_PER_ANGLE_X * 10.0).clamp(-800.0, 800.0), (angle_y / PITCH_PER_ANGLE_Y * 10.0).clamp(-600.0, 600.0)] };
         let blend = 1.0 - (-self.head_dt_ms / HEAD_SMOOTH_MS).exp();
         self.head_at[0] += (target[0] - self.head_at[0]) * blend;
         self.head_at[1] += (target[1] - self.head_at[1]) * blend;

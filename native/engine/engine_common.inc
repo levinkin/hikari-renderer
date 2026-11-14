@@ -73,6 +73,7 @@ struct engine : public CubismUserModel, public engine_gpu
     using CubismUserModel::_physics;
     ICubismModelSetting* setting = NULL;
     std::map<std::string, ACubismMotion*> expressions;
+    float transition_seconds = 0.5f;
     csmVector<CubismBreath::BreathParameterData> breath_parameters;
     CubismMatrix44 mvp;
     int width = 0;
@@ -94,7 +95,7 @@ struct engine : public CubismUserModel, public engine_gpu
     float view_rot = 0;
     float physics_weight = 1;
     float wind = 0;
-    float wind_direction = 0;
+    float wind_cos = 1, wind_sin = 0;
     float gravity_degrees = NAN;
     bool drop_turns = false;
     double wind_clock = 0;
@@ -110,7 +111,6 @@ struct engine : public CubismUserModel, public engine_gpu
     uint32_t motion_seed = 0;
     unsigned int blink_seed = 1;
     csmVector<CubismIdHandle> blink_ids;
-    std::vector<csmInt32> blink_indices;
     csmVector<CubismIdHandle> lip_ids;
     std::vector<float> blink_open;
     std::map<ACubismMotion*, std::vector<csmInt32>> motion_params;
@@ -289,9 +289,9 @@ static ACubismMotion* motion_load(engine* e, const std::string& path, const csmC
         }
     }
     bool holds = false;
-    for (csmInt32 blink_index : e->blink_indices)
+    for (csmInt32 blink = 0; blink < e->blink_ids.GetSize(); blink++)
     {
-        holds = holds || std::find(params.begin(), params.end(), blink_index) != params.end();
+        holds = holds || std::find(params.begin(), params.end(), e->_model->GetParameterIndex(e->blink_ids[blink])) != params.end();
     }
     e->holds_eyes[motion] = holds;
     return motion;
@@ -377,6 +377,11 @@ static engine* load_model(const std::string& path, const std::string& dir, int w
     }
     static const char empty_expression[] = "{\"Type\":\"Live2D Expression\",\"FadeInTime\":0.3,\"FadeOutTime\":0.3,\"Parameters\":[]}";
     e->expressions[""] = e->LoadExpression((const csmByte*)empty_expression, (csmSizeInt)strlen(empty_expression), "");
+    for (auto& expression : e->expressions)
+    {
+        expression.second->SetFadeInTime(e->transition_seconds);
+        expression.second->SetFadeOutTime(e->transition_seconds);
+    }
     e->pose_expressions.reset(new CubismExpressionMotionManager());
     if (strcmp(e->setting->GetPhysicsFileName(), "") != 0)
     {
@@ -399,7 +404,6 @@ static engine* load_model(const std::string& path, const std::string& dir, int w
     for (csmInt32 i = 0; i < e->setting->GetEyeBlinkParameterCount(); i++)
     {
         e->blink_ids.PushBack(e->setting->GetEyeBlinkParameterId(i));
-        e->blink_indices.push_back(e->_model->GetParameterIndex(e->setting->GetEyeBlinkParameterId(i)));
     }
     for (csmInt32 i = 0; i < e->setting->GetLipSyncParameterCount(); i++)
     {
@@ -534,6 +538,8 @@ bool engine_expression_add(engine* e, const char* name, const char* path)
         ACubismMotion::Delete(found->second);
     }
     e->expressions[name] = motion;
+    motion->SetFadeInTime(e->transition_seconds);
+    motion->SetFadeOutTime(e->transition_seconds);
     return true;
 }
 
@@ -549,22 +555,27 @@ bool engine_expression_keep(engine* e, const char* name)
     return true;
 }
 
-void engine_expression_fade(engine* e, const char* name, float seconds)
+void engine_transition_seconds(engine* e, float seconds)
 {
-    auto found = e->expressions.find(name);
-    if (found == e->expressions.end())
+    if (e->transition_seconds == seconds)
     {
         return;
     }
-    found->second->SetFadeInTime(seconds);
-    found->second->SetFadeOutTime(seconds);
+    e->transition_seconds = seconds;
+    for (auto& expression : e->expressions)
+    {
+        expression.second->SetFadeInTime(seconds);
+        expression.second->SetFadeOutTime(seconds);
+    }
 }
 
 void engine_physics_set(engine* e, float strength, float wind, float wind_degrees, float gravity_degrees)
 {
     e->physics_weight = std::fmax(strength / 50.0f, 0.0f);
     e->wind = std::isfinite(wind) ? wind / 100.0f : 0.0f;
-    e->wind_direction = fmodf(wind_degrees - 90.0f, 360.0f) * (float)M_PI / 180.0f;
+    float radians = fmodf(wind_degrees - 90.0f, 360.0f) * (float)M_PI / 180.0f;
+    e->wind_cos = cosf(radians);
+    e->wind_sin = sinf(radians);
     if (std::fabs(gravity_degrees - e->gravity_degrees) >= 180.0f)
     {
         e->drop_turns = true;
@@ -603,9 +614,8 @@ void engine_physics_scale(engine* e, const char* id, float strength, float wind)
 
 void engine_expressions_stop(engine* e)
 {
-    CSM_DELETE(e->_expressionManager);
-    e->_expressionManager = CSM_NEW CubismExpressionMotionManager();
-    e->pose_expressions.reset(new CubismExpressionMotionManager());
+    engine_expression(e, 0, "");
+    engine_expression(e, 1, "");
 }
 
 void engine_breath_enable(engine* e, bool on)
@@ -723,7 +733,8 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
         ACubismMotion* motion = entry->GetCubismMotion();
         char mark = entry->IsTriggeredFadeOut() || (entry->GetEndTime() >= 0.0f && entry->GetStateTime() >= entry->GetEndTime() - motion->GetFadeOutTime()) ? 1 : 2;
         bool idle_motion = e->idle != NULL && std::find(e->idle->begin(), e->idle->end(), motion) != e->idle->end();
-        eyes_held = eyes_held || (mark == 2 && !idle_motion && e->holds_eyes[motion]);
+        auto held = e->holds_eyes.find(motion);
+        eyes_held = eyes_held || (mark == 2 && !idle_motion && held != e->holds_eyes.end() && held->second);
         for (csmInt32 index : e->motion_params[motion])
         {
             e->rest_marks[index] = std::max(e->rest_marks[index], mark);
@@ -791,8 +802,8 @@ void engine_update(engine* e, float dt_ms, engine_hook after_motion_update, engi
             double gusts = 0.45 * sin(3.1 * t + p[0]) + 0.35 * sin(5.3 * t + p[1]) + 0.2 * sin(1.3 * t + p[2]);
             float along = e->wind * (float)((0.45 + 0.45 * gusts) * (0.7 + 0.3 * sin(0.23 * t + p[3])));
             float across = e->wind * (float)(0.08 * sin(2.9 * t + p[1]));
-            options.Wind.X = along * cosf(e->wind_direction) + across * sinf(e->wind_direction);
-            options.Wind.Y = across * cosf(e->wind_direction) - along * sinf(e->wind_direction);
+            options.Wind.X = along * e->wind_cos + across * e->wind_sin;
+            options.Wind.Y = across * e->wind_cos - along * e->wind_sin;
             e->_physics->SetOptions(options);
             if (!e->physics_scales.empty())
             {

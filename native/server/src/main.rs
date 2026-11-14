@@ -1,6 +1,7 @@
 mod behavior;
 mod codec;
 mod engine_ffi;
+mod settings_tui;
 mod vtube;
 
 use behavior::Behavior;
@@ -28,7 +29,7 @@ type Frames = (Vec<((usize, usize), Vec<u8>)>, [u8; 4]);
 
 enum Job {
     Tick { dt_ms: f32, sizes: Vec<(usize, usize)>, reply: Sender<Frames> },
-    Step { lane: Lane, dt_ms: f32, mouth: f32, size: (usize, usize), reply: Sender<(Vec<u8>, [u8; 4])> },
+    Step { owner: usize, dt_ms: f32, mouth: f32, size: (usize, usize), reply: Sender<(Vec<u8>, [u8; 4])> },
     React { kind: String, reply: Sender<Value> },
     Wake,
     Background { bytes: Option<Arc<Vec<u8>>>, content_type: String, reply: Sender<i32> },
@@ -58,8 +59,8 @@ extern "C" {
 
 const SPLIT_SIZE: (usize, usize) = (320, 240);
 const MOUTHS: usize = 256;
-const REST_ANGLE_MAX: u64 = 100;
-const REST_ANGLE_DEFAULT: u64 = 10;
+const TRANSITION_SECONDS_MAX: f64 = 3.0;
+const TRANSITION_SECONDS_DEFAULT: f64 = 0.5;
 const WINDOW_TURN_DEGREES: f32 = 90.0;
 const PHYSICS_DEFAULT: [f32; 4] = [50.0, 0.0, 90.0, 0.0];
 const MODEL_FRAMING: [f32; 4] = [f32::NAN; 4];
@@ -92,7 +93,7 @@ struct App {
     params: Mutex<Vec<(String, i32, f32)>>,
     physics: Mutex<Option<[f32; 4]>>,
     settings_physics: Mutex<serde_json::Map<String, Value>>,
-    rest_angle: AtomicU64,
+    transition_seconds: AtomicU64,
     shared: Mutex<Shared>,
     picture: (Mutex<Picture>, Condvar),
     lane_locks: [Mutex<()>; 3],
@@ -146,6 +147,7 @@ struct Model {
     framing: Option<[f32; 4]>,
     params: Vec<(String, f32, f32, i32)>,
     physics: [f32; 4],
+    own_physics: Option<(f32, f32)>,
 }
 
 struct Scene {
@@ -153,6 +155,7 @@ struct Scene {
     lanes: Vec<LaneState>,
     targets: HashMap<(usize, usize), (*mut engine_ffi::Engine, Instant)>,
     asleep: bool,
+    stepped_since_tick: bool,
 }
 
 unsafe impl Send for Scene {}
@@ -577,7 +580,7 @@ fn handle_render(app: &App, out: &mut TcpStream, body: io::Take<Body>, fps: f64,
         drop(mouths);
         let pts = (k as f64 * 1000.0 / fps).floor();
         let (reply, frame) = channel();
-        app.jobs.send(Job::Step { lane, dt_ms: (1000.0 / fps) as f32, mouth, size, reply }).unwrap();
+        app.jobs.send(Job::Step { owner, dt_ms: (1000.0 / fps) as f32, mouth, size, reply }).unwrap();
         let (rgba, head) = frame.recv().unwrap();
         if !write_frame(out, pts, &head, codec_id, &codec::encode(&rgba, size.0, size.1, codec_name)) {
             break;
@@ -597,6 +600,11 @@ fn handle_render(app: &App, out: &mut TcpStream, body: io::Take<Body>, fps: f64,
     }
     reader.join().ok();
     app.rendering[lane as usize].store(false, Ordering::SeqCst);
+    let mut mouths = app.mouths.lock().unwrap_or_else(PoisonError::into_inner);
+    if mouths.owner == owner {
+        mouths.owner = 0;
+    }
+    drop(mouths);
     drop(guard);
     out.write_all(if codec_id == MJPEG { b"--frame--\r\n".as_slice() } else { b"0\r\n\r\n".as_slice() }).ok();
     println!("hikari: fps={} frames={} behind_ms_max={}", fps, k, behind_max.round());
@@ -657,9 +665,9 @@ fn physics_changes(fields: &serde_json::Map<String, Value>) -> Result<Vec<(usize
     Ok(changes)
 }
 
-fn effective_physics(own: Option<(f32, f32)>, fallback: &serde_json::Map<String, Value>) -> [f32; 4] {
+fn effective_physics(own: Option<(f32, f32)>, changes: &[(usize, f32)]) -> [f32; 4] {
     let mut values = PHYSICS_DEFAULT;
-    for (index, value) in physics_changes(fallback).unwrap_or_default() {
+    for &(index, value) in changes {
         values[index] = value;
     }
     if let Some((strength, wind)) = own {
@@ -677,7 +685,7 @@ fn describe_model(name: &str, setup: &vtube::VtubeSetup, shipped: &[(String, Pat
     actions.extend(default_actions.iter().map(|(name, _)| name.clone()));
     actions.sort();
     actions.dedup();
-    Model { name: name.to_string(), states, actions, framing: setup.framing, params: Vec::new(), physics: effective_physics(setup.physics, fallback) }
+    Model { name: name.to_string(), states, actions, framing: setup.framing, params: Vec::new(), physics: effective_physics(setup.physics, &physics_changes(fallback).unwrap_or_default()), own_physics: setup.physics }
 }
 
 fn post_state(app: &App, req: &Request, out: &mut TcpStream) {
@@ -722,21 +730,36 @@ fn post_state(app: &App, req: &Request, out: &mut TcpStream) {
 fn post_params(app: &App, body: Body, out: &mut TcpStream) {
     let Some(fields) = read_object(body, out, "POST /params") else { return };
     let model = app.model.lock().unwrap_or_else(PoisonError::into_inner);
-    let rows: Vec<_> = fields.iter().map(|(id, value)| (id, value, model.params.iter().find(|row| &row.0 == id))).collect();
-    let unknown: Vec<&str> = rows.iter().filter(|row| row.2.is_none()).map(|row| row.0.as_str()).collect();
+    let mut unknown = Vec::new();
+    let mut matched = Vec::new();
+    for (id, value) in &fields {
+        let mut found = None;
+        for row in &model.params {
+            if &row.0 == id {
+                found = Some(row);
+                break;
+            }
+        }
+        match found {
+            Some(row) => matched.push((id, value, row)),
+            None => unknown.push(id.as_str()),
+        }
+    }
     if !unknown.is_empty() {
         send_body(out, 400, "text/plain", format!("hikari: unknown params {}\n", unknown.join(",")).as_bytes());
         return;
     }
-    if let Some((id, _)) = fields.iter().find(|(_, value)| !value.is_null() && !value.is_number()) {
-        send_body(out, 400, "text/plain", format!("hikari: {} must be a number or null\n", id).as_bytes());
-        return;
+    for (id, value) in &fields {
+        if !value.is_null() && !value.is_number() {
+            send_body(out, 400, "text/plain", format!("hikari: {} must be a number or null\n", id).as_bytes());
+            return;
+        }
     }
     let mut params = app.params.lock().unwrap_or_else(PoisonError::into_inner);
-    for (id, value, row) in &rows {
-        params.retain(|held| &held.0 != *id);
-        if let (Some(value), Some(row)) = (value.as_f64(), row) {
-            params.push(((*id).clone(), row.3, (value as f32).clamp(row.1, row.2)));
+    for (id, value, row) in matched {
+        params.retain(|held| &held.0 != id);
+        if let Some(value) = value.as_f64() {
+            params.push((id.clone(), row.3, (value as f32).clamp(row.1, row.2)));
         }
     }
     let held: serde_json::Map<String, Value> = params.iter().map(|(id, _, value)| (id.clone(), json!(value))).collect();
@@ -1350,14 +1373,17 @@ fn parse_idle(idle_actions: Option<&Value>, action_every: Option<&Value>, action
     Ok((known, every, unknown, banned))
 }
 
-fn read_rest_angle(value: Option<&Value>) -> Result<Option<u64>, &Value> {
+fn read_transition_seconds(value: Option<&Value>) -> Result<Option<f64>, &Value> {
     let Some(value) = value else { return Ok(None) };
-    value.as_u64().filter(|angle| *angle <= REST_ANGLE_MAX).map(Some).ok_or(value)
+    match value.as_f64() {
+        Some(seconds) if seconds.is_finite() && (0.0..=TRANSITION_SECONDS_MAX).contains(&seconds) => Ok(Some(seconds)),
+        _ => Err(value),
+    }
 }
 
 fn settings_json(app: &App) -> Value {
     let idle = app.idle.lock().unwrap_or_else(PoisonError::into_inner);
-    json!({ "model": app.model.lock().unwrap_or_else(PoisonError::into_inner).name.clone(), "size": [app.size.0, app.size.1], "idle_actions": idle.actions, "action_every": idle.every, "face": idle.face, "idle_loop": idle.idle_loop, "rest_angle": app.rest_angle.load(Ordering::SeqCst), "physics": app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner).clone() })
+    json!({ "model": app.model.lock().unwrap_or_else(PoisonError::into_inner).name.clone(), "size": [app.size.0, app.size.1], "idle_actions": idle.actions, "action_every": idle.every, "face": idle.face, "idle_loop": idle.idle_loop, "transition_seconds": f64::from_bits(app.transition_seconds.load(Ordering::SeqCst)), "physics": app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner).clone() })
 }
 
 fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
@@ -1367,21 +1393,21 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
         send_body(out, 400, "text/plain", format!("hikari: {} is restart-only, edit settings.json and restart\n", key).as_bytes());
         return;
     }
-    if let Some(key) = fields.keys().find(|key| !["idle_actions", "action_every", "model", "face", "rest_angle", "physics"].contains(&key.as_str())) {
+    if let Some(key) = fields.keys().find(|key| !["idle_actions", "action_every", "model", "face", "transition_seconds", "physics"].contains(&key.as_str())) {
         send_body(out, 400, "text/plain", format!("hikari: unknown setting {}\n", key).as_bytes());
         return;
     }
-    let rest_angle = match read_rest_angle(fields.get("rest_angle")) {
-        Ok(angle) => angle,
+    let transition_seconds = match read_transition_seconds(fields.get("transition_seconds")) {
+        Ok(seconds) => seconds,
         Err(other) => {
-            send_body(out, 400, "text/plain", format!("hikari: rest_angle must be an integer 0..{}, got {}\n", REST_ANGLE_MAX, other).as_bytes());
+            send_body(out, 400, "text/plain", format!("hikari: transition_seconds must be a number 0..{}, got {}\n", TRANSITION_SECONDS_MAX, other).as_bytes());
             return;
         }
     };
     let physics = match fields.get("physics") {
         None => None,
         Some(Value::Object(physics)) => match physics_changes(physics) {
-            Ok(_) => Some(physics.clone()),
+            Ok(changes) => Some((physics.clone(), changes)),
             Err(line) => {
                 send_body(out, 400, "text/plain", format!("{}\n", line).as_bytes());
                 return;
@@ -1392,7 +1418,7 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
             return;
         }
     };
-    let rest_only = (rest_angle.is_some() || physics.is_some()) && fields.len() == rest_angle.iter().count() + physics.iter().count();
+    let no_reload = (physics.is_some() || transition_seconds.is_some()) && fields.len() == physics.iter().count() + transition_seconds.iter().count();
     let model = match fields.get("model") {
         None => None,
         Some(Value::String(name)) if app.models.contains_key(name) => Some(name.clone()),
@@ -1406,8 +1432,12 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
         (idle.path.clone(), idle.actions.clone(), idle.every.clone())
     };
     let current = app.model.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    let target = match &model {
-        Some(name) if *name != current.name => describe_model(name, &vtube::load(&app.models[name]), &app.shipped, &app.default_actions, &app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner)),
+    let setup = match &model {
+        Some(name) if *name != current.name => Some(vtube::load(&app.models[name])),
+        _ => None,
+    };
+    let target = match (&setup, &model) {
+        (Some(setup), Some(name)) => describe_model(name, setup, &app.shipped, &app.default_actions, &app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner)),
         _ => current,
     };
     let face = match fields.get("face") {
@@ -1456,7 +1486,7 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
     let mut scene = None;
     if let Some(name) = &switch_to {
         app.shared.lock().unwrap_or_else(PoisonError::into_inner).pending.push(name.clone());
-        scene = build_scene(app, name);
+        scene = build_scene(app, name, setup);
         if scene.is_none() {
             unpin(app, name);
             send_body(out, 500, "text/plain", format!("hikari: model {} failed to load\n", name).as_bytes());
@@ -1485,11 +1515,11 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
     println!("hikari: idle actions={} action_every={}", actions.join(","), every);
     idle.actions = actions;
     idle.every = every;
-    if !rest_only {
+    if !no_reload {
         idle.generation += 1;
     }
-    if let Some(angle) = rest_angle {
-        app.rest_angle.store(angle, Ordering::SeqCst);
+    if let Some(seconds) = transition_seconds {
+        app.transition_seconds.store(seconds.to_bits(), Ordering::SeqCst);
     }
     if let Some(face) = face {
         idle.face = face.clone();
@@ -1500,24 +1530,27 @@ fn put_settings(app: &App, body: Body, out: &mut TcpStream) {
         }
     }
     drop(idle);
-    if let Some(physics) = physics {
+    if let Some((physics, changes)) = physics {
         let mut model = app.model.lock().unwrap_or_else(PoisonError::into_inner);
-        model.physics = effective_physics(vtube::load(&app.models[&model.name]).physics, &physics);
+        model.physics = effective_physics(model.own_physics, &changes);
         *app.physics.lock().unwrap_or_else(PoisonError::into_inner) = Some(model.physics);
         *app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner) = physics;
     }
     send_body(out, 200, "application/json", settings_json(app).to_string().as_bytes());
 }
 
-fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)]) -> Option<(Vec<LaneState>, vtube::VtubeSetup)> {
+fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)], setup: Option<vtube::VtubeSetup>) -> Option<(Vec<LaneState>, vtube::VtubeSetup)> {
     let path = app.models.get(name)?.to_string_lossy().into_owned();
     let model = CString::new(path.as_str()).ok()?;
-    let setup = vtube::load(Path::new(&path));
+    let setup = match setup {
+        Some(setup) => setup,
+        None => vtube::load(Path::new(&path)),
+    };
     let physics = setup.physics.map_or("none".to_string(), |(strength, wind)| format!("{},{}", strength, wind));
     println!("hikari: vtube model={} params={} expressions={} physics={}", name, setup.outputs.values().map(Vec::len).sum::<usize>(), setup.expressions.len(), physics);
     let view = model_view(&app.views.lock().unwrap_or_else(PoisonError::into_inner), name, setup.framing);
     println!("hikari: view model={} zoom={} x={} y={} rot={}", name, view[0], view[1], view[2], view[3]);
-    let physics = effective_physics(setup.physics, &app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner));
+    let physics = effective_physics(setup.physics, &physics_changes(&app.settings_physics.lock().unwrap_or_else(PoisonError::into_inner)).unwrap_or_default());
     let mut lanes: Vec<LaneState> = Vec::new();
     for &(width, height) in sizes {
         let engine = unsafe { engine_ffi::engine_create(model.as_ptr(), width as i32, height as i32) };
@@ -1528,11 +1561,6 @@ fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)]) -> Option<(Vec<L
             }
             unsafe { engine_ffi::engine_textures_release(model.as_ptr()) };
             return None;
-        }
-        for expression in &setup.expressions {
-            if let Ok(id) = CString::new(expression.file_stem.as_str()) {
-                unsafe { engine_ffi::engine_expression_fade(engine, id.as_ptr(), expression.fade_seconds) };
-            }
         }
         unsafe { engine_ffi::engine_physics_set(engine, physics[0], physics[1], physics[2], physics[3]) };
         for (param, strength, wind) in &setup.physics_scales {
@@ -1546,7 +1574,7 @@ fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)]) -> Option<(Vec<L
             }
         }
         let idle_loop = app.idle.lock().unwrap_or_else(PoisonError::into_inner).idle_loop.clone();
-        let mut behavior = Behavior::new(engine, &setup, &app.shipped, &app.default_actions, &idle_loop, app.rest_angle.load(Ordering::SeqCst) as f64);
+        let mut behavior = Behavior::new(engine, &setup, &app.shipped, &app.default_actions, &idle_loop);
         unsafe { engine_ffi::engine_view_set(engine, view[0], view[1], view[2], view[3]) };
         behavior.update(0.0, -1.0);
         unsafe { engine_ffi::engine_render(engine, behavior.bg_clock_ms as f32) };
@@ -1563,9 +1591,9 @@ fn build_lanes(app: &App, name: &str, sizes: &[(usize, usize)]) -> Option<(Vec<L
     Some((lanes, setup))
 }
 
-fn build_scene(app: &App, name: &str) -> Option<Scene> {
+fn build_scene(app: &App, name: &str, setup: Option<vtube::VtubeSetup>) -> Option<Scene> {
     let started = Instant::now();
-    let Some((lanes, setup)) = build_lanes(app, name, &[app.size, app.size, SPLIT_SIZE]) else {
+    let Some((lanes, setup)) = build_lanes(app, name, &[app.size], setup) else {
         eprintln!("hikari: model {} failed to load", name);
         app.broken.lock().unwrap_or_else(PoisonError::into_inner).push(name.to_string());
         return None;
@@ -1587,7 +1615,7 @@ fn build_scene(app: &App, name: &str) -> Option<Scene> {
             model.params.push((id.to_string_lossy().into_owned(), row.1, row.2, row.3));
         }
     }
-    Some(Scene { model, lanes, targets: HashMap::new(), asleep: false })
+    Some(Scene { model, lanes, targets: HashMap::new(), asleep: false, stepped_since_tick: false })
 }
 
 fn drop_scene(app: &App, scene: Scene) {
@@ -1652,20 +1680,19 @@ impl Scene {
     }
 
     fn prepare(&mut self, app: &App, lane: Lane) {
-        let name = self.model.name.clone();
         let state = &mut self.lanes[lane as usize];
+        unsafe { engine_ffi::engine_transition_seconds(state.engine, f64::from_bits(app.transition_seconds.load(Ordering::SeqCst)) as f32) };
         sync_idle(app, state);
         sync_state(app, state);
         state.behavior.head_lead_ms = app.head_lead_ms.load(Ordering::SeqCst) as f32;
         state.behavior.params.clear();
         state.behavior.params.extend(app.params.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|row| (row.1, row.2)));
-        state.behavior.rest_angle = app.rest_angle.load(Ordering::SeqCst) as f64;
         let physics = app.physics.lock().unwrap_or_else(PoisonError::into_inner).unwrap_or(self.model.physics);
         if physics != state.physics {
             unsafe { engine_ffi::engine_physics_set(state.engine, physics[0], physics[1], physics[2], physics[3]) };
             state.physics = physics;
         }
-        state.view = model_view(&app.views.lock().unwrap_or_else(PoisonError::into_inner), &name, state.framing);
+        state.view = model_view(&app.views.lock().unwrap_or_else(PoisonError::into_inner), &self.model.name, state.framing);
     }
 
     fn sleep(&mut self, app: &App) -> Value {
@@ -1696,7 +1723,7 @@ impl Scene {
 fn run_render(app: Arc<App>, jobs: Receiver<Job>, port: u16) {
     let wanted = app.model.lock().unwrap_or_else(PoisonError::into_inner).name.clone();
     let order = std::iter::once(wanted.clone()).chain(app.models.keys().filter(|name| **name != wanted).cloned());
-    let Some(mut scene) = order.into_iter().find_map(|name| build_scene(&app, &name)) else {
+    let Some(mut scene) = order.into_iter().find_map(|name| build_scene(&app, &name, None)) else {
         eprintln!("hikari: no model loads");
         std::process::exit(1);
     };
@@ -1716,7 +1743,9 @@ fn run_render(app: Arc<App>, jobs: Receiver<Job>, port: u16) {
                 scene.prepare(&app, Lane::Shared);
                 let mut shared = app.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 let state = &mut scene.lanes[Lane::Shared as usize];
-                state.behavior.update(dt_ms, mouth);
+                if !std::mem::take(&mut scene.stepped_since_tick) {
+                    state.behavior.update(dt_ms, mouth);
+                }
                 shared.bg_clock_ms = state.behavior.bg_clock_ms;
                 drop(shared);
                 let head = scene.lanes[Lane::Shared as usize].behavior.head;
@@ -1730,11 +1759,21 @@ fn run_render(app: Arc<App>, jobs: Receiver<Job>, port: u16) {
                 });
                 reply.send((frames, head)).ok();
             }
-            Job::Step { lane, dt_ms, mouth, size, reply } => {
-                scene.prepare(&app, lane);
-                scene.lanes[lane as usize].behavior.update(dt_ms, mouth);
-                let rgba = scene.render(&app, lane, size);
-                reply.send((rgba, scene.lanes[lane as usize].behavior.head)).ok();
+            Job::Step { owner, dt_ms, mouth, size, reply } => {
+                scene.prepare(&app, Lane::Shared);
+                let mut mouths = app.mouths.lock().unwrap_or_else(PoisonError::into_inner);
+                if mouths.owner == 0 {
+                    mouths.owner = owner;
+                    mouths.fps = 0.0;
+                }
+                let advance = mouths.owner == owner;
+                drop(mouths);
+                if advance {
+                    scene.lanes[Lane::Shared as usize].behavior.update(dt_ms, mouth);
+                    scene.stepped_since_tick = true;
+                }
+                let rgba = scene.render(&app, Lane::Shared, size);
+                reply.send((rgba, scene.lanes[Lane::Shared as usize].behavior.head)).ok();
             }
             Job::React { kind, reply } => {
                 if kind == "sleep" {
@@ -1743,11 +1782,6 @@ fn run_render(app: Arc<App>, jobs: Receiver<Job>, port: u16) {
                 }
                 scene.wake(&app);
                 let played = scene.lanes[Lane::Shared as usize].behavior.react(&kind);
-                for lane in [Lane::Render, Lane::RenderSplit] {
-                    if app.rendering[lane as usize].load(Ordering::SeqCst) {
-                        scene.lanes[lane as usize].behavior.react(&kind);
-                    }
-                }
                 reply.send(played).ok();
             }
             Job::Wake => scene.wake(&app),
@@ -1852,15 +1886,20 @@ fn setting_model(settings: &Value, models: &BTreeMap<String, PathBuf>) -> String
 fn main() {
     unsafe { engine_ffi::engine_core_load() };
     let args: Vec<String> = std::env::args().collect();
-    let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    let exe = std::env::current_exe().unwrap();
+    let exe_dir = exe.parent().unwrap().to_path_buf();
     let (settings, settings_path) = read_settings(&exe_dir);
     let mut port_arg = None;
     let mut window = false;
     let mut fps = 60u32;
     let mut share = true;
+    let mut settings_only = false;
+    let mut no_settings = false;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
+            "--settings" => settings_only = true,
+            "--no-settings" => no_settings = true,
             "--port" => {
                 let value = rest.next().cloned().unwrap_or_default();
                 port_arg = port_arg.or(Some(value));
@@ -1901,6 +1940,12 @@ fn main() {
             }
         },
     };
+    let built_bg_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../background"));
+    let bg_dir = if built_bg_dir.is_dir() { built_bg_dir } else { exe_dir.join("background") };
+    if settings_only {
+        settings_tui::run(port, bg_dir);
+        return;
+    }
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -1908,8 +1953,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if !no_settings {
+        thread::spawn(move || settings_tui::open_window(&exe, port));
+    }
     let (jobs, job_queue) = channel();
-    let built_bg_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../background"));
     let models = discover_models(&exe_dir);
     if models.is_empty() {
         eprintln!("hikari: no models in {}; copy a model folder there, for example Samples/Resources/Hiyori from the Cubism SDK", exe_dir.join("models").display());
@@ -1950,11 +1997,11 @@ fn main() {
         println!("hikari: settings.json idle_loop {} is not an idle motion, using the default", settings["idle_loop"]);
         idle_loop = String::new();
     }
-    let rest_angle = match read_rest_angle(settings.get("rest_angle")) {
-        Ok(angle) => angle.unwrap_or(REST_ANGLE_DEFAULT),
+    let transition_seconds = match read_transition_seconds(settings.get("transition_seconds")) {
+        Ok(seconds) => seconds.unwrap_or(TRANSITION_SECONDS_DEFAULT),
         Err(other) => {
-            println!("hikari: settings.json rest_angle {} is not an integer 0..{}, using {}", other, REST_ANGLE_MAX, REST_ANGLE_DEFAULT);
-            REST_ANGLE_DEFAULT
+            println!("hikari: settings.json transition_seconds {} is not a number 0..{}, using {}", other, TRANSITION_SECONDS_MAX, TRANSITION_SECONDS_DEFAULT);
+            TRANSITION_SECONDS_DEFAULT
         }
     };
     let now = Instant::now();
@@ -1969,7 +2016,7 @@ fn main() {
         broken: Mutex::new(Vec::new()),
         bg_lock: Mutex::new(()),
         settings_lock: Mutex::new(()),
-        bg_dir: if built_bg_dir.is_dir() { built_bg_dir } else { exe_dir.join("background") },
+        bg_dir,
         shipped,
         default_actions,
         views: Mutex::new(Views { live: HashMap::new(), saved: load_views(&exe_dir.join("views.json")), path: exe_dir.join("views.json") }),
@@ -1981,7 +2028,7 @@ fn main() {
         params: Mutex::new(Vec::new()),
         physics: Mutex::new(None),
         settings_physics: Mutex::new(settings_physics),
-        rest_angle: AtomicU64::new(rest_angle),
+        transition_seconds: AtomicU64::new(transition_seconds.to_bits()),
         shared: Mutex::new(Shared { engine: 0, name: String::new(), window: String::new(), pending: Vec::new(), bg_clock_ms: 0.0 }),
         picture: (Mutex::new(Picture { seq: 0, head: [0; 4], frames: HashMap::new(), wants: Vec::new(), window_fps: 0.0 }), Condvar::new()),
         lane_locks: Default::default(),
@@ -2014,7 +2061,7 @@ extern "C" fn window_step(context: *mut c_void) {
     if wanted != frame.name {
         shared.pending.push(wanted.clone());
         drop(shared);
-        let Some((mut lanes, _)) = build_lanes(frame.app, &wanted, &[frame.size]) else {
+        let Some((mut lanes, _)) = build_lanes(frame.app, &wanted, &[frame.size], None) else {
             unpin(frame.app, &wanted);
             release_textures(frame.app, &wanted);
             thread::sleep(Duration::from_millis(10));
@@ -2091,7 +2138,7 @@ fn run_window(app: &App, size: (usize, usize), fps: u32, share: bool) {
     }
     let name = app.model.lock().unwrap_or_else(PoisonError::into_inner).name.clone();
     app.shared.lock().unwrap_or_else(PoisonError::into_inner).pending.push(name.clone());
-    let Some((mut lanes, _)) = build_lanes(app, &name, &[size]) else {
+    let Some((mut lanes, _)) = build_lanes(app, &name, &[size], None) else {
         eprintln!("hikari: window model {} unavailable", name);
         std::process::exit(1);
     };

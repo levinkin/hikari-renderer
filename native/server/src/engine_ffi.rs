@@ -29,7 +29,7 @@ extern "C" {
     pub fn engine_expression(e: *mut Engine, layer: i32, name: *const c_char) -> bool;
     pub fn engine_expression_add(e: *mut Engine, name: *const c_char, path: *const c_char) -> bool;
     pub fn engine_expression_keep(e: *mut Engine, name: *const c_char) -> bool;
-    pub fn engine_expression_fade(e: *mut Engine, name: *const c_char, seconds: f32);
+    pub fn engine_transition_seconds(e: *mut Engine, seconds: f32);
     pub fn engine_physics_set(e: *mut Engine, strength: f32, wind: f32, wind_degrees: f32, gravity_degrees: f32);
     pub fn engine_physics_scale(e: *mut Engine, param_id: *const c_char, strength: f32, wind: f32);
     pub fn engine_expressions_stop(e: *mut Engine);

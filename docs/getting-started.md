@@ -75,7 +75,7 @@ numbers are all big-endian for faster comparisons/debugging.
 | `GET /view` | none | the model's current framing, its saved one and its default | `{"zoom", "x", "y", "rot", "saved", "default"}` (`saved` is `null` if never saved) | - |
 | `PUT /view` | `zoom`, `x`, `y`, `rot` (number, current value), `save` (bool, `false`) | moves the framing live. `save=true` also writes it to `views.json` | `204`, `500` if saving fails | `PUT /view?zoom=1.5&save=true` |
 | `GET /settings` | none | the current settings | json | - |
-| `PUT /settings` | json body with any of `model`, `face`, `idle_actions`, `action_every`, `rest_angle`, `physics` | changes them live and saves them to `settings.json` | the new settings, `400` for a bad value or a restart-only key, `500` if `settings.json` can't be read or written | `{"face": "neutral", "action_every": [10, 30]}` |
+| `PUT /settings` | json body with any of `model`, `face`, `idle_actions`, `action_every`, `transition_seconds`, `physics` | changes them live and saves them to `settings.json` | the new settings, `400` for a bad value or a restart-only key, `500` if `settings.json` can't be read or written | `{"face": "neutral", "action_every": [10, 30], "transition_seconds": 0.5}` |
 | `GET /background` | none | describes the current background | `{"kind", "name", "updated", ...}` | - |
 | `GET /background/file` | none | the background image itself | the image, or `404` | - |
 | `PUT /background` | none. body: a png, jpeg or gif | sets/switches a background from the body (5 MB max, animated gifs play) | 200, `400` if it isn't png/jpeg/gif or can't decode, `413` if too big | a png body |
@@ -123,6 +123,8 @@ in the frame stream, the picture after the codec byte depends on the codec:
 | `--fps N` | integer | window frame rate, 1 to 240 | `60` |
 | `--no-share` | bool | stops sharing frames with obs (spout2 on windows, syphon on mac) | `false` |
 | `--port N` | integer | serves on that port for this run, 1 to 65535 | `port` setting |
+| `--settings` | bool | opens the settings screen for the hikari already running on `port` (it opens in its own terminal window on every launch) | `false` |
+| `--no-settings` | bool | skips opening the settings screen on launch | `false` |
 
 ## settings.json
 
@@ -135,7 +137,7 @@ in the frame stream, the picture after the codec byte depends on the codec:
 | `idle_actions` | list of strings | actions to pick from at random, `[]` for none | `["look_around", "glance_left", "glance_right", "double_blink", "yawn", "tilt_smile", "look_up_think"]` |
 | `action_every` | integer or `[min, max]` | whole seconds between idle actions, > 0. a pair waits a random time between the two | `15` |
 | `idle_loop` | string | an `Idle` motion name | the vtube studio idle animation, else the first `Idle` motion |
-| `rest_angle` | integer | 0 to 100, how far the robot's head tilts at rest (percent of its range) | `10` |
+| `transition_seconds` | number | 0 to 3 seconds for expression fade in and out, including faces, poses and vtube studio hotkey expressions. adjustable live with `PUT /settings` or the settings screen's `transition` row | `0.5` |
 | `physics` | object | same shape as the `POST /physics` body, any subset, e.g. `{"wind": {"strength": 40, "direction": 270}, "gravity": {"direction": 0}}`. used for models whose `.vtube.json` has no physics of its own (a model's own strength and wind win). directions always come from here | `{"strength": 50, "wind": {"strength": 0, "direction": 90}, "gravity": {"direction": 0}}` |
 
 actions are model3.json motion groups and vtube studio animation hotkeys, plus some default shipped ones in `default.model3.json` next to the launcher. edit that file to change them.
